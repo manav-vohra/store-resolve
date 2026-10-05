@@ -192,13 +192,13 @@ export class SignalWireSmsProvider implements NotificationProvider {
     })
     const body = await this.responseBody(response)
     const message = messageFrom(body)
-    if (response.status !== 201 || !message)
-      throw new Error(
-        safeDiagnostic(
-          body.message ?? body.error_message ?? `SignalWire request failed (${response.status})`,
-          [this.config.projectId, this.config.apiToken],
-        ),
-      )
+    if (response.status !== 201 || !message) {
+      const code = body.code ?? body.error_code
+      const detail = [code ? `[${code}]` : '', body.message ?? body.error_message ?? `SignalWire request failed (${response.status})`]
+        .filter(Boolean)
+        .join(' ')
+      throw new Error(safeDiagnostic(detail, [this.config.projectId, this.config.apiToken]))
+    }
     if (message.accountSid !== this.config.projectId || !uuid.test(message.sid))
       throw new Error('SignalWire returned an unexpected message identity')
     return { providerMessageId: message.sid, status: 'SENT' }
