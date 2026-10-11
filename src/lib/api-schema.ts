@@ -43,6 +43,19 @@ export const testNotificationSchema = z.object({
   recipientUserId: z.enum(['father', 'uncle', 'grandfather', 'pilot-admin', 'dad']),
   confirmed: z.literal(true),
 })
+const base64url = z
+  .string()
+  .min(8)
+  .max(256)
+  .regex(/^[A-Za-z0-9_-]+$/, 'Must be base64url')
+export const pushSubscribeSchema = z.object({
+  endpoint: z.string().url().startsWith('https://').max(2000),
+  keys: z.object({ p256dh: base64url, auth: base64url }),
+  deviceLabel: z.string().trim().min(1).max(80).optional(),
+})
+export const pushUnsubscribeSchema = z.object({
+  endpoint: z.string().url().startsWith('https://').max(2000),
+})
 export const signalWireCallbackSchema = z.union([
   z.object({ id: z.string().uuid(), project_id: z.string().uuid() }),
   z.object({ MessageSid: z.string().uuid() }),

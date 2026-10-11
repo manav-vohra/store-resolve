@@ -1,4 +1,5 @@
 import type { Notification } from '../src/lib/types'
+import { sendWebPush, type WebPushPayload, type PushSendResult } from './webpush'
 
 export interface NotificationProvider {
   readonly ready: boolean
@@ -267,5 +268,46 @@ export class SignalWireSmsProvider implements NotificationProvider {
           [this.config.projectId, this.config.apiToken],
         ),
       )
+  }
+}
+
+export interface PushSubscriptionRecord {
+  endpoint: string
+  p256dhKey: string
+  authKey: string
+}
+
+/**
+ * Web Push delivery adapter. Unlike the SMS provider it is not constructed
+ * around the `NotificationProvider.send(notification, destination)` shape,
+ * because push delivery needs the subscription's encryption keys, not just an
+ * address. The `NotificationProvider` interface is left untouched so the
+ * SignalWire implementation is unaffected; the channel-aware dispatcher
+ * (Stage B) calls `sendToSubscription` directly.
+ */
+export class WebPushProvider {
+  constructor(
+    private readonly config: { publicKey?: string; privateKey?: string; subject?: string },
+  ) {}
+
+  get ready(): boolean {
+    return Boolean(this.config.publicKey && this.config.privateKey && this.config.subject)
+  }
+
+  async sendToSubscription(
+    subscription: PushSubscriptionRecord,
+    payload: WebPushPayload,
+  ): Promise<PushSendResult> {
+    if (!this.ready || !this.config.publicKey || !this.config.privateKey || !this.config.subject)
+      throw new Error('Web Push is not configured')
+    return sendWebPush(
+      {
+        publicKey: this.config.publicKey,
+        privateKey: this.config.privateKey,
+        subject: this.config.subject,
+      },
+      { endpoint: subscription.endpoint, p256dh: subscription.p256dhKey, auth: subscription.authKey },
+      payload,
+    )
   }
 }

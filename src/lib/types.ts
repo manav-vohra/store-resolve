@@ -73,16 +73,28 @@ export interface Notification {
   complaintId: string
   eventType: EventType | 'TEST'
   recipientUserId: string
-  channel: 'SMS' | 'IN_APP'
+  channel: 'SMS' | 'IN_APP' | 'PUSH' | 'EMAIL'
   message: string
   status: NotificationStatus
-  provider: 'MOCK' | 'SIGNALWIRE'
+  provider: 'MOCK' | 'SIGNALWIRE' | 'WEBPUSH' | 'GRAPH'
   providerMessageId?: string
   createdAt: string
   sentAt?: string
   deliveredAt?: string
   failedAt?: string
   failureReason?: string
+}
+export interface PushSubscription {
+  id: string
+  organizationId: string
+  userId: string
+  endpoint: string
+  p256dhKey: string
+  authKey: string
+  deviceLabel?: string
+  createdAt: string
+  lastUsedAt?: string
+  revokedAt?: string
 }
 export interface Complaint {
   id: string

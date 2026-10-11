@@ -12,6 +12,7 @@ run_worker_first = ["/api/*", "/diagnostics/pilot-mail"]
 [vars]
 NOTIFICATION_MODE = "FAMILY_PILOT"
 EXTERNAL_NOTIFICATIONS_ENABLED = "false"
+VAPID_PUBLIC_KEY = "BEaf_RWjGAb19TP5EoFUiEU5Sautp58BH5RLzMSbZwApds4Ob9sudVD4WkOUhQD6pMugRNms93Sm9Zknt2cjCAk"
 
 # The operations tick is intentionally NOT scheduled. The legacy tick loads unbounded
 # application state per run; re-add a [triggers] block only together with the scoped tick.

@@ -6,6 +6,8 @@ import {
   complaintInputSchema,
   configSchema,
   contactSchema,
+  pushSubscribeSchema,
+  pushUnsubscribeSchema,
   responseApprovalSchema,
   responseDraftSchema,
   responseTemplateSchema,
@@ -22,7 +24,7 @@ import type { AppState, User } from '../src/lib/types'
 import { authenticate, canAdmin, canViewComplaint, maskEmail, maskPhone } from './auth'
 import { REVIEW_QUEUE_DETAIL_QUERY, REVIEW_QUEUE_LIST_QUERY } from './review-queue'
 import { loadState, persistState, type D1Database } from './d1'
-import { SignalWireSmsProvider } from './providers'
+import { SignalWireSmsProvider, WebPushProvider } from './providers'
 import { applySignalWireCallback, reconcileSignalWireMessage } from './callbacks'
 import {
   maskGraphIdentifier,
@@ -54,6 +56,8 @@ type Bindings = Env & {
   SIGNALWIRE_SPACE_URL?: string
   SIGNALWIRE_PHONE_NUMBER?: string
   PUBLIC_BASE_URL?: string
+  VAPID_PUBLIC_KEY?: string
+  VAPID_PRIVATE_KEY?: string
   MS_CLIENT_ID?: string
   MS_CLIENT_SECRET?: string
   MS_REFRESH_TOKEN?: string
@@ -74,6 +78,12 @@ const provider = (env: Bindings) =>
     spaceUrl: env.SIGNALWIRE_SPACE_URL,
     from: env.SIGNALWIRE_PHONE_NUMBER,
     publicBaseUrl: env.PUBLIC_BASE_URL,
+  })
+const webPush = (env: Bindings) =>
+  new WebPushProvider({
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+    subject: env.PUBLIC_BASE_URL ?? 'https://store-resolve.moogzie.workers.dev',
   })
 const emailProvider = (env: Bindings) =>
   new MicrosoftGraphProvider({
@@ -709,6 +719,166 @@ app.put('/api/admin/contacts/:id', zValidator('json', contactSchema), async (c) 
   await persistState(c.env.DB, state)
   return c.json(publicState(await loadState(c.env.DB), user))
 })
+// ---------------------------------------------------------------------------
+// Stage A: Web Push subscriptions and gated test delivery.
+//
+// All endpoints sit behind the existing Cloudflare Access authentication
+// (app.use('/api/*')); subscriptions are always bound to the authenticated
+// user. Real-recipient test sends are disabled by the `push_test_sends_enabled`
+// settings kill switch until explicitly approved.
+// ---------------------------------------------------------------------------
+
+app.get('/api/push/public-key', (c) => {
+  if (!c.env.VAPID_PUBLIC_KEY)
+    return c.json(jsonError('Push notifications are not configured'), 503)
+  return c.json({ publicKey: c.env.VAPID_PUBLIC_KEY })
+})
+
+app.post('/api/push/subscribe', zValidator('json', pushSubscribeSchema), async (c) => {
+  const user = c.get('user')
+  const { endpoint, keys, deviceLabel } = c.req.valid('json')
+  const existing = await c.env.DB.prepare(
+    'SELECT id, user_id, revoked_at FROM push_subscriptions WHERE endpoint=?',
+  )
+    .bind(endpoint)
+    .first<{ id: string; user_id: string; revoked_at: string | null }>()
+  if (existing && existing.user_id !== user.id)
+    return c.json(jsonError('This device is already registered to another user'), 409)
+  const now = new Date().toISOString()
+  if (existing) {
+    await c.env.DB.prepare(
+      `UPDATE push_subscriptions SET p256dh_key=?, auth_key=?, device_label=COALESCE(?, device_label), revoked_at=NULL, last_used_at=? WHERE id=?`,
+    )
+      .bind(keys.p256dh, keys.auth, deviceLabel ?? null, now, existing.id)
+      .run()
+  } else {
+    const org = await c.env.DB.prepare('SELECT organization_id FROM users WHERE id=?')
+      .bind(user.id)
+      .first<{ organization_id: string }>()
+    await c.env.DB.prepare(
+      `INSERT INTO push_subscriptions(id,organization_id,user_id,endpoint,p256dh_key,auth_key,device_label,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+    )
+      .bind(
+        crypto.randomUUID(),
+        org?.organization_id ?? 'org-1',
+        user.id,
+        endpoint,
+        keys.p256dh,
+        keys.auth,
+        deviceLabel ?? null,
+        now,
+      )
+      .run()
+  }
+  return c.json({ ok: true })
+})
+
+app.post('/api/push/unsubscribe', zValidator('json', pushUnsubscribeSchema), async (c) => {
+  const user = c.get('user')
+  const { endpoint } = c.req.valid('json')
+  await c.env.DB.prepare(
+    `UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND user_id=? AND revoked_at IS NULL`,
+  )
+    .bind(new Date().toISOString(), endpoint, user.id)
+    .run()
+  return c.json({ ok: true })
+})
+
+app.post('/api/admin/push/test', zValidator('json', testNotificationSchema), async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const { recipientUserId } = c.req.valid('json')
+  const state = await loadState(c.env.DB)
+  const recipient = state.users.find((u) => u.id === recipientUserId)
+  if (!recipient || !testRecipientIds.includes(recipient.id))
+    return c.json(jsonError('Controlled test recipient required'), 400)
+  // Kill switch: real-recipient push sends stay disabled until explicitly approved.
+  const killSwitch = await c.env.DB.prepare(`SELECT value FROM settings WHERE key='push_test_sends_enabled'`)
+    .first<{ value: string }>()
+  if (killSwitch?.value !== 'true')
+    return c.json(jsonError('Push test sends are disabled by the operator kill switch'), 409)
+  const last = await c.env.DB.prepare(
+    'SELECT last_sent_at FROM test_notification_rate_limits WHERE recipient_user_id=?',
+  )
+    .bind(recipient.id)
+    .first<{ last_sent_at: string }>()
+  if (last && Date.now() - new Date(last.last_sent_at).getTime() < 300000)
+    return c.json(jsonError('Please wait five minutes before another test to this recipient'), 429)
+  const subscription = await c.env.DB.prepare(
+    `SELECT endpoint, p256dh_key, auth_key FROM push_subscriptions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC LIMIT 1`,
+  )
+    .bind(recipient.id)
+    .first<{ endpoint: string; p256dh_key: string; auth_key: string }>()
+  const now = new Date().toISOString()
+  const id = `pushtest-${crypto.randomUUID()}`
+  let status = 'SUPPRESSED',
+    reason: string | undefined
+  if (!webPush(c.env).ready) reason = 'WEBPUSH_NOT_READY'
+  else if (!subscription) reason = 'NO_PUSH_SUBSCRIPTION'
+  else {
+    const outstanding = state.complaints.filter(
+      (complaint) =>
+        complaint.assignedManagerId === recipient.id &&
+        !['CLOSED'].includes(complaint.status),
+    ).length
+    try {
+      const result = await webPush(c.env).sendToSubscription(
+        {
+          endpoint: subscription.endpoint,
+          p256dhKey: subscription.p256dh_key,
+          authKey: subscription.auth_key,
+        },
+        {
+          title: 'StoreResolve test',
+          body: 'TEST — push notifications are connected to this device. No action needed.',
+          url: '/',
+          tag: 'storeresolve-test-push',
+          badgeCount: outstanding,
+        },
+      )
+      if (result.expired) {
+        status = 'FAILED'
+        reason = 'SUBSCRIPTION_EXPIRED'
+        await c.env.DB.prepare(
+          `UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND revoked_at IS NULL`,
+        )
+          .bind(now, subscription.endpoint)
+          .run()
+      } else {
+        status = 'SENT'
+        await c.env.DB.prepare(`UPDATE push_subscriptions SET last_used_at=? WHERE endpoint=?`)
+          .bind(now, subscription.endpoint)
+          .run()
+      }
+    } catch (error) {
+      status = 'FAILED'
+      reason = (error as Error).message
+    }
+  }
+  await c.env.DB.prepare(
+    `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,NULL,'TEST',?,'PUSH',?,?,?,?,?,?, ?,?)`,
+  )
+    .bind(
+      id,
+      recipient.id,
+      'StoreResolve test push notification',
+      status,
+      'WEBPUSH',
+      null,
+      now,
+      status === 'SENT' ? now : null,
+      status === 'FAILED' ? now : null,
+      reason ?? null,
+    )
+    .run()
+  await c.env.DB.prepare(
+    'INSERT INTO test_notification_rate_limits(recipient_user_id,last_sent_at) VALUES(?,?) ON CONFLICT(recipient_user_id) DO UPDATE SET last_sent_at=excluded.last_sent_at',
+  )
+    .bind(recipient.id, now)
+    .run()
+  return c.json(publicState(await loadState(c.env.DB), user))
+})
+
 app.post('/api/admin/test-notifications', zValidator('json', testNotificationSchema), async (c) => {
   const user = c.get('user')
   if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
