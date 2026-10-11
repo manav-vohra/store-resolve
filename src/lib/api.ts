@@ -116,6 +116,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ recipientUserId, confirmed: true }),
     }),
+  pushPublicKey: () =>
+    request('/push/public-key', z.object({ publicKey: z.string().min(1) })),
+  pushSubscribe: (input: { endpoint: string; keys: { p256dh: string; auth: string }; deviceLabel?: string }) =>
+    request('/push/subscribe', z.object({ ok: z.literal(true) }), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  pushUnsubscribe: (endpoint: string) =>
+    request('/push/unsubscribe', z.object({ ok: z.literal(true) }), {
+      method: 'POST',
+      body: JSON.stringify({ endpoint }),
+    }),
+  sendTestPush: (recipientUserId: 'father' | 'uncle' | 'grandfather' | 'pilot-admin' | 'dad') =>
+    request('/admin/push/test', stateSchema, {
+      method: 'POST',
+      body: JSON.stringify({ recipientUserId, confirmed: true }),
+    }),
   reconcileSignalWire: (providerMessageId: string) =>
     request('/admin/signalwire/reconcile', reconciliationSchema, {
       method: 'POST',

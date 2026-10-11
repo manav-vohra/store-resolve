@@ -20,6 +20,14 @@ import {
 } from 'lucide-react'
 import { metrics } from './lib/workflow'
 import { api } from './lib/api'
+import { parseComplaintHash } from './lib/deep-links'
+import {
+  getPushStatus,
+  isStandalone,
+  subscribeForPush,
+  unsubscribeLocalPush,
+  type PushStatus,
+} from './lib/push'
 import ReviewQueue from './ReviewQueue'
 import { fixtures, initialState } from './lib/seed'
 import type { AppState, Complaint, IntegrationHealth, NewComplaint, Severity } from './lib/types'
@@ -49,10 +57,6 @@ const cx = (...x: (string | false | undefined)[]) => x.filter(Boolean).join(' ')
 // Push notification taps (`notificationclick` → `clients.openWindow(url)`) and
 // shareable links. The hash keeps the URL stable behind Cloudflare Access and
 // requires no router changes.
-const parseComplaintHash = (): string | undefined => {
-  const match = /^#\/complaints\/([A-Za-z0-9-]+)\/?$/.exec(window.location.hash)
-  return match?.[1]
-}
 const syncHashForView = (next: string, id?: string) => {
   if (next === 'detail' && id) {
     const target = `#/complaints/${id}`
@@ -136,7 +140,7 @@ export default function App() {
   useEffect(() => {
     if (loading) return
     const openFromHash = () => {
-      const id = parseComplaintHash()
+      const id = parseComplaintHash(window.location.hash)
       if (!id) return
       const allowed =
         user.role === 'STORE_MANAGER'
@@ -367,7 +371,9 @@ export default function App() {
             />
           )}
           {view === 'settings' && (
-            <PilotControls
+            <>
+              <PushNotificationSettings show={show} />
+              <PilotControls
               state={state}
               setState={setState}
               providerReady={providerReady}
@@ -425,7 +431,17 @@ export default function App() {
                   show((error as Error).message)
                 }
               }}
+              onSendTestPush={(id) =>
+                api
+                  .sendTestPush(id)
+                  .then((next) => {
+                    setState(next)
+                    show('Push test attempt recorded')
+                  })
+                  .catch((error: Error) => show(error.message))
+              }
             />
+            </>
           )}
         </div>
       </main>
@@ -1474,6 +1490,100 @@ function ReportsView({ state }: { state: AppState }) {
   )
 }
 
+function PushNotificationSettings({ show }: { show: (message: string) => void }) {
+  const [status, setStatus] = useState<PushStatus>('prompt')
+  const [busy, setBusy] = useState(false)
+  const [problem, setProblem] = useState<string>()
+  const standalone = isStandalone()
+
+  useEffect(() => {
+    getPushStatus()
+      .then(setStatus)
+      .catch(() => setStatus('unsupported'))
+  }, [])
+
+  const enable = async () => {
+    setBusy(true)
+    setProblem(undefined)
+    try {
+      const { publicKey } = await api.pushPublicKey()
+      const keys = await subscribeForPush(publicKey)
+      await api.pushSubscribe({
+        endpoint: keys.endpoint,
+        keys: { p256dh: keys.p256dh, auth: keys.auth },
+        deviceLabel: standalone ? 'Home Screen app' : 'Browser',
+      })
+      setStatus('subscribed')
+      show('Push notifications enabled on this device')
+    } catch (error) {
+      setProblem((error as Error).message)
+      setStatus(await getPushStatus().catch(() => 'unsupported' as PushStatus))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const disable = async () => {
+    setBusy(true)
+    setProblem(undefined)
+    try {
+      const endpoint = await unsubscribeLocalPush()
+      if (endpoint) await api.pushUnsubscribe(endpoint)
+      setStatus('unsubscribed')
+      show('Push notifications disabled on this device')
+    } catch (error) {
+      setProblem((error as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="panel settings-card">
+      <h2>Push notifications</h2>
+      <p>
+        Get StoreResolve alerts on this device, even when the app is closed. Tapping a
+        notification opens the complaint directly.
+      </p>
+      {status === 'unsupported' && (
+        <p>Push notifications aren&apos;t supported on this device or browser.</p>
+      )}
+      {status === 'denied' && (
+        <p>
+          Notifications are blocked for StoreResolve. Enable them in your device settings, then
+          return here.
+        </p>
+      )}
+      {!standalone && (status === 'prompt' || status === 'unsubscribed') && (
+        <p>
+          <strong>iPhone tip:</strong> for notifications to work, install StoreResolve first —
+          tap Share <strong>→ Add to Home Screen</strong>, then open it from your Home Screen
+          and enable notifications here.
+        </p>
+      )}
+      {(status === 'prompt' || status === 'unsubscribed') && (
+        <button className="secondary" disabled={busy} onClick={enable}>
+          {busy ? 'Enabling…' : 'Enable push notifications'}
+        </button>
+      )}
+      {status === 'subscribed' && (
+        <>
+          <p>
+            <strong>Enabled on this device.</strong> You&apos;ll receive complaint alerts here.
+          </p>
+          <button className="secondary" disabled={busy} onClick={disable}>
+            {busy ? 'Disabling…' : 'Disable on this device'}
+          </button>
+        </>
+      )}
+      {problem && <p className="form-error">{problem}</p>}
+      <small>
+        Notifications never include customer details — only the store and case reference.
+      </small>
+    </section>
+  )
+}
+
 function PilotControls({
   state,
   setState,
@@ -1482,6 +1592,7 @@ function PilotControls({
   health,
   onSaveConfig,
   onSendTest,
+  onSendTestPush,
   onReconcile,
   onPilotIngest,
 }: {
@@ -1492,6 +1603,7 @@ function PilotControls({
   health?: IntegrationHealth
   onSaveConfig: (config: AppState['config']) => void
   onSendTest: (id: 'father' | 'uncle' | 'grandfather' | 'pilot-admin' | 'dad') => void
+  onSendTestPush: (id: 'father' | 'uncle' | 'grandfather' | 'pilot-admin' | 'dad') => void
   onReconcile: (providerMessageId: string) => void
   onPilotIngest: () => void
 }) {
@@ -1504,6 +1616,7 @@ function PilotControls({
     'father' | 'uncle' | 'grandfather' | 'pilot-admin' | 'dad'
   >('pilot-admin')
   const [confirmed, setConfirmed] = useState(false)
+  const [pushConfirmed, setPushConfirmed] = useState(false)
   const chosen = testRecipients.find((candidate) => candidate.id === recipient)
   const recentTests = state.testNotifications
     .filter((notification) => notification.recipientUserId === recipient)
@@ -1875,6 +1988,43 @@ function PilotControls({
               ))}
             </div>
           )}
+        </section>
+        <section className="panel settings-card">
+          <h2>Test push notification</h2>
+          <p>
+            Sends a harmless test push to the selected recipient&apos;s subscribed device.
+            Requires the recipient to have enabled push notifications in the section above.
+          </p>
+          <div className="readiness-list">
+            <span>
+              Recipient <strong>{chosen?.name ?? 'Not selected'}</strong>
+            </span>
+            <span>
+              Needs <strong>an active push subscription</strong> for the recipient
+            </span>
+          </div>
+          <label className="confirm-row">
+            <input
+              type="checkbox"
+              checked={pushConfirmed}
+              onChange={(e) => setPushConfirmed(e.target.checked)}
+            />{' '}
+            I confirm one harmless test push to {chosen?.name ?? 'the selected recipient'}
+          </label>
+          <button
+            className="secondary"
+            disabled={!pushConfirmed || !chosen}
+            onClick={() => {
+              onSendTestPush(recipient)
+              setPushConfirmed(false)
+            }}
+          >
+            Send one confirmed test push
+          </button>
+          <small>
+            Disabled until the operator enables push test sends. The server rechecks every
+            safety gate; the kill switch stays off by default.
+          </small>
         </section>
       </div>
     </>

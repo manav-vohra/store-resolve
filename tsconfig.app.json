@@ -17,5 +17,5 @@
     "jsx": "react-jsx",
     "types": ["vite/client", "vitest/globals"]
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "worker-configuration.d.ts"]
 }
