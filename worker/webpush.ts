@@ -106,36 +106,67 @@ async function vapidJwt(vapid: VapidConfig, audience: string): Promise<string> {
     ),
   )
   const signingInput = te.encode(`${header}.${payload}`)
-  const der = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, signingInput))
-  return `${header}.${payload}.${b64urlEncode(derToRaw(der))}`
+  const sig = new Uint8Array(
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, signingInput),
+  )
+  // WebCrypto returns ECDSA signatures as raw r||s (64 bytes); accept a
+  // DER encoding as a fallback for non-conforming runtimes.
+  const raw = sig.length === 64 ? sig : derToRaw(sig)
+  return `${header}.${payload}.${b64urlEncode(raw)}`
 }
 
-async function hkdfExpand(prk: Uint8Array, info: Uint8Array, lengthBytes: number): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey('raw', prk, 'HKDF', false, ['deriveBits'])
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
+async function hmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
     key,
-    lengthBytes * 8,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
   )
-  return new Uint8Array(bits)
+  return new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, data))
 }
 
-interface EncryptedBody {
-  bytes: Uint8Array
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
+  let offset = 0
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.length
+  }
+  return out
 }
 
-/** RFC 8291 §3 aes128gcm encryption of the payload for one subscription. */
-async function encryptPayload(sub: WebPushSubscription, plaintext: string): Promise<EncryptedBody> {
-  const clientPublicRaw = b64urlDecode(sub.p256dh)
-  if (clientPublicRaw.length !== 65 || clientPublicRaw[0] !== 0x04)
-    throw new Error('Invalid subscription p256dh key')
-  const authSecret = b64urlDecode(sub.auth)
+export interface DerivedPushKeys {
+  ecdhSecret: Uint8Array
+  prkKey: Uint8Array
+  ikm: Uint8Array
+  prk: Uint8Array
+  cek: Uint8Array
+  nonce: Uint8Array
+  serverPublicRaw: Uint8Array
+}
 
-  const serverKeys = await crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveBits'],
-  )
+/**
+ * RFC 8291 §3.4 key derivation, mirroring the RFC pseudocode step for step:
+ *
+ *   PRK_key = HMAC-SHA-256(auth_secret, ecdh_secret)
+ *   IKM     = HMAC-SHA-256(PRK_key, key_info || 0x01)          [HKDF-Expand, 32]
+ *   PRK     = HMAC-SHA-256(salt, IKM)                          [HKDF-Extract]
+ *   CEK     = HMAC-SHA-256(PRK, cek_info || 0x01)[0..15]       [HKDF-Expand, 16]
+ *   NONCE   = HMAC-SHA-256(PRK, nonce_info || 0x01)[0..11]     [HKDF-Expand, 12]
+ *
+ * The per-message `salt` is mixed in at the PRK step — it MUST be the same
+ * salt written into the message header. Exported so tests can verify the
+ * intermediate values against RFC 8291 Appendix A.
+ */
+export async function derivePushKeys(
+  clientPublicRaw: Uint8Array,
+  authSecret: Uint8Array,
+  serverPrivateKey: CryptoKey,
+  serverPublicRaw: Uint8Array,
+  salt: Uint8Array,
+): Promise<DerivedPushKeys> {
+  if (salt.length !== 16) throw new Error('Push salt must be 16 bytes')
   const clientKey = await crypto.subtle.importKey(
     'raw',
     clientPublicRaw,
@@ -144,25 +175,68 @@ async function encryptPayload(sub: WebPushSubscription, plaintext: string): Prom
     [],
   )
   const ecdhSecret = new Uint8Array(
-    await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKey }, serverKeys.privateKey, 256),
+    await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKey }, serverPrivateKey, 256),
   )
+
+  const prkKey = await hmacSha256(authSecret, ecdhSecret)
+
+  const keyInfo = concatBytes([
+    te.encode('WebPush: info'),
+    new Uint8Array([0x00]),
+    clientPublicRaw,
+    serverPublicRaw,
+  ])
+  const ikm = (await hmacSha256(prkKey, concatBytes([keyInfo, new Uint8Array([0x01])]))).slice(0, 32)
+
+  const prk = await hmacSha256(salt, ikm)
+
+  const cekInfo = te.encode('Content-Encoding: aes128gcm\0')
+  const cek = (await hmacSha256(prk, concatBytes([cekInfo, new Uint8Array([0x01])]))).slice(0, 16)
+
+  const nonceInfo = te.encode('Content-Encoding: nonce\0')
+  const nonce = (await hmacSha256(prk, concatBytes([nonceInfo, new Uint8Array([0x01])]))).slice(0, 12)
+
+  return { ecdhSecret, prkKey, ikm, prk, cek, nonce, serverPublicRaw }
+}
+
+interface EncryptedBody {
+  bytes: Uint8Array
+}
+
+export interface EncryptOverrides {
+  /** Fixed 16-byte salt (tests only; random per message in production). */
+  salt?: Uint8Array
+  /** Fixed server ECDH keypair (tests only; ephemeral per message in production). */
+  serverKeys?: CryptoKeyPair
+}
+
+/**
+ * RFC 8291 §3 aes128gcm encryption of the payload for one subscription.
+ * Exported for verification against the RFC 8291 Appendix A test vector.
+ */
+export async function encryptPayload(
+  sub: WebPushSubscription,
+  plaintext: string,
+  overrides: EncryptOverrides = {},
+): Promise<EncryptedBody> {
+  const clientPublicRaw = b64urlDecode(sub.p256dh)
+  if (clientPublicRaw.length !== 65 || clientPublicRaw[0] !== 0x04)
+    throw new Error('Invalid subscription p256dh key')
+  const authSecret = b64urlDecode(sub.auth)
+
+  const serverKeys =
+    overrides.serverKeys ??
+    (await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']))
   const serverPublicRaw = new Uint8Array(await crypto.subtle.exportKey('raw', serverKeys.publicKey))
+  const salt = overrides.salt ?? crypto.getRandomValues(new Uint8Array(16))
 
-  // PRK = HMAC-SHA-256(auth_secret, ecdh_secret)
-  const hmacKey = await crypto.subtle.importKey('raw', authSecret, { name: 'HMAC', hash: 'SHA-256' }, false, [
-    'sign',
-  ])
-  const prk = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, ecdhSecret))
-
-  const keyInfo = new Uint8Array([
-    ...te.encode('WebPush: info'),
-    0x00,
-    ...clientPublicRaw,
-    ...serverPublicRaw,
-  ])
-  const ikm = await hkdfExpand(prk, keyInfo, 32)
-  const cek = await hkdfExpand(ikm, te.encode('Content-Encoding: aes128gcm\0'), 16)
-  const nonce = await hkdfExpand(ikm, te.encode('Content-Encoding: nonce\0'), 12)
+  const { cek, nonce } = await derivePushKeys(
+    clientPublicRaw,
+    authSecret,
+    serverKeys.privateKey,
+    serverPublicRaw,
+    salt,
+  )
 
   // Plaintext record: message || 0x02 delimiter (no extra padding).
   const messageBytes = te.encode(plaintext)
@@ -175,7 +249,6 @@ async function encryptPayload(sub: WebPushSubscription, plaintext: string): Prom
     await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aesKey, record),
   )
 
-  const salt = crypto.getRandomValues(new Uint8Array(16))
   const rs = 4096
   const out = new Uint8Array(16 + 4 + 1 + serverPublicRaw.length + ciphertext.length)
   out.set(salt, 0)
@@ -197,6 +270,20 @@ export interface PushSendResult {
 }
 
 /**
+ * Privacy-safe test payload. Title/body carry no customer PII — only the app
+ * name and a TEST marker. Deep-link URL is the app root.
+ */
+export function buildTestPushPayload(badgeCount: number): WebPushPayload {
+  return {
+    title: 'StoreResolve test',
+    body: 'TEST — push notifications are connected to this device. No action needed.',
+    url: '/',
+    tag: 'storeresolve-test-push',
+    badgeCount,
+  }
+}
+
+/**
  * Send one encrypted push message. Throws on transport/provider errors.
  * A 404/410 resolves to `{expired: true}` instead of throwing so the caller
  * can revoke the subscription.
@@ -206,12 +293,13 @@ export async function sendWebPush(
   sub: WebPushSubscription,
   payload: WebPushPayload,
   ttlSeconds = 86400,
+  overrides: EncryptOverrides = {},
 ): Promise<PushSendResult> {
   const endpoint = new URL(sub.endpoint)
   if (endpoint.protocol !== 'https:') throw new Error('Push endpoint must use https')
   if (!vapid.publicKey || !vapid.privateKey || !vapid.subject) throw new Error('Web Push is not configured')
 
-  const { bytes } = await encryptPayload(sub, JSON.stringify(payload))
+  const { bytes } = await encryptPayload(sub, JSON.stringify(payload), overrides)
 
   const jwt = await vapidJwt(vapid, endpoint.origin)
   const response = await fetch(sub.endpoint, {

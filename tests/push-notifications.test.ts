@@ -10,6 +10,8 @@ import {
   b64urlDecode,
   b64urlEncode,
   buildTestPushPayload,
+  derivePushKeys,
+  encryptPayload,
   sendWebPush,
 } from '../worker/webpush'
 import worker from '../worker/index'
@@ -58,24 +60,33 @@ class SqliteD1 implements D1Database {
 const NOW = '2026-10-11T15:00:00.000Z'
 const te = new TextEncoder()
 
-async function hkdfExpand(prk: Uint8Array, info: Uint8Array, lengthBytes: number) {
-  const key = await crypto.subtle.importKey('raw', prk, 'HKDF', false, ['deriveBits'])
-  return new Uint8Array(
-    await crypto.subtle.deriveBits(
-      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info },
-      key,
-      lengthBytes * 8,
-    ),
-  )
+async function hmac(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, data))
 }
 
-/** Independent client-side decryption of an RFC 8291 aes128gcm body. */
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
+  let off = 0
+  for (const p of parts) {
+    out.set(p, off)
+    off += p.length
+  }
+  return out
+}
+
+/**
+ * Independent client-side decryption, written directly from the RFC 8291 §3.4
+ * pseudocode (not by mirroring the sender's code path). The per-message salt
+ * from the header is mixed into the PRK step.
+ */
 async function clientDecrypt(
   body: Uint8Array,
   clientPrivateKey: CryptoKey,
   clientPublicRaw: Uint8Array,
   authSecret: Uint8Array,
 ): Promise<string> {
+  const salt = body.slice(0, 16)
   const serverPublicRaw = body.slice(21, 21 + 65)
   const serverKey = await crypto.subtle.importKey(
     'raw',
@@ -87,24 +98,21 @@ async function clientDecrypt(
   const ecdhSecret = new Uint8Array(
     await crypto.subtle.deriveBits({ name: 'ECDH', public: serverKey }, clientPrivateKey, 256),
   )
-  const hmacKey = await crypto.subtle.importKey(
-    'raw',
-    authSecret,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  )
-  const prk = new Uint8Array(await crypto.subtle.sign('HMAC', hmacKey, ecdhSecret))
-  const keyInfo = new Uint8Array(
-    te.encode('WebPush: info').length + 1 + clientPublicRaw.length + serverPublicRaw.length,
-  )
-  keyInfo.set(te.encode('WebPush: info'), 0)
-  keyInfo[te.encode('WebPush: info').length] = 0x00
-  keyInfo.set(clientPublicRaw, te.encode('WebPush: info').length + 1)
-  keyInfo.set(serverPublicRaw, te.encode('WebPush: info').length + 1 + clientPublicRaw.length)
-  const ikm = await hkdfExpand(prk, keyInfo, 32)
-  const cek = await hkdfExpand(ikm, te.encode('Content-Encoding: aes128gcm\0'), 16)
-  const nonce = await hkdfExpand(ikm, te.encode('Content-Encoding: nonce\0'), 12)
+  const prkKey = await hmac(authSecret, ecdhSecret)
+  const keyInfo = concat([
+    te.encode('WebPush: info'),
+    new Uint8Array([0x00]),
+    clientPublicRaw,
+    serverPublicRaw,
+  ])
+  const ikm = (await hmac(prkKey, concat([keyInfo, new Uint8Array([0x01])]))).slice(0, 32)
+  const prk = await hmac(salt, ikm)
+  const cek = (
+    await hmac(prk, concat([te.encode('Content-Encoding: aes128gcm\0'), new Uint8Array([0x01])]))
+  ).slice(0, 16)
+  const nonce = (
+    await hmac(prk, concat([te.encode('Content-Encoding: nonce\0'), new Uint8Array([0x01])]))
+  ).slice(0, 12)
   const ciphertext = body.slice(21 + 65)
   const aesKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt'])
   const record = new Uint8Array(
@@ -119,6 +127,168 @@ describe('webpush crypto', () => {
     const bytes = crypto.getRandomValues(new Uint8Array(64))
     expect(b64urlDecode(b64urlEncode(bytes))).toEqual(bytes)
   })
+
+  // Published test vector: RFC 8291, Appendix A ("Intermediate Values for
+  // Encryption"). Only the base64url values are reproduced here, no prose.
+  const RFC8291_A = {
+    plaintext: 'V2hlbiBJIGdyb3cgdXAsIEkgd2FudCB0byBiZSBhIHdhdGVybWVsb24',
+    as_public:
+      'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8',
+    as_private: 'yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw',
+    ua_public:
+      'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4',
+    salt: 'DGv6ra1nlYgDCS1FRnbzlw',
+    auth_secret: 'BTBZMqHH6r4Tts7J_aSIgg',
+    ecdh_secret: 'kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs',
+    prk_key: 'Snr3JMxaHVDXHWJn5wdC52WjpCtd2EIEGBykDcZW32k',
+    ikm: 'S4lYMb_L0FxCeq0WhDx813KgSYqU26kOyzWUdsXYyrg',
+    prk: '09_eUZGrsvxChDCGRCdkLiDXrReGOEVeSCdCcPBSJSc',
+    cek: 'oIhVW04MRdy2XN9CiKLxTg',
+    nonce: '4h_95klXJ5E_qnoN',
+    ciphertext:
+      '8pfeW0KbunFT06SuDKoJH9Ql87S1QUrdirN6GcG7sFz1y1sqLgVi1VhjVkHsUoEsbI_0LpXMuGvnzQ',
+  }
+
+  async function rfcServerKeys(): Promise<CryptoKeyPair> {
+    const asPubRaw = b64urlDecode(RFC8291_A.as_public)
+    const publicKey = await crypto.subtle.importKey(
+      'raw',
+      asPubRaw,
+      { name: 'ECDH', namedCurve: 'P-256' },
+      true,
+      [],
+    )
+    const privateKey = await crypto.subtle.importKey(
+      'jwk',
+      {
+        kty: 'EC',
+        crv: 'P-256',
+        x: b64urlEncode(asPubRaw.slice(1, 33)),
+        y: b64urlEncode(asPubRaw.slice(33, 65)),
+        d: RFC8291_A.as_private,
+      },
+      { name: 'ECDH', namedCurve: 'P-256' },
+      true,
+      ['deriveBits'],
+    )
+    return { publicKey, privateKey }
+  }
+
+  it('matches the RFC 8291 Appendix A intermediate key values', async () => {
+    const serverKeys = await rfcServerKeys()
+    const keys = await derivePushKeys(
+      b64urlDecode(RFC8291_A.ua_public),
+      b64urlDecode(RFC8291_A.auth_secret),
+      serverKeys.privateKey,
+      b64urlDecode(RFC8291_A.as_public),
+      b64urlDecode(RFC8291_A.salt),
+    )
+    expect(b64urlEncode(keys.ecdhSecret)).toBe(RFC8291_A.ecdh_secret)
+    expect(b64urlEncode(keys.prkKey)).toBe(RFC8291_A.prk_key)
+    expect(b64urlEncode(keys.ikm)).toBe(RFC8291_A.ikm)
+    expect(b64urlEncode(keys.prk)).toBe(RFC8291_A.prk)
+    expect(b64urlEncode(keys.cek)).toBe(RFC8291_A.cek)
+    expect(b64urlEncode(keys.nonce)).toBe(RFC8291_A.nonce)
+  })
+
+  it('reproduces the RFC 8291 Appendix A encrypted message byte-for-byte', async () => {
+    const serverKeys = await rfcServerKeys()
+    const plaintext = new TextDecoder().decode(b64urlDecode(RFC8291_A.plaintext))
+    expect(plaintext).toBe('When I grow up, I want to be a watermelon')
+    const { bytes } = await encryptPayload(
+      {
+        endpoint: 'https://push.example.invalid/rfc',
+        p256dh: RFC8291_A.ua_public,
+        auth: RFC8291_A.auth_secret,
+      },
+      plaintext,
+      { salt: b64urlDecode(RFC8291_A.salt), serverKeys },
+    )
+    // Expected: 86-octet header (salt || rs=4096 || idlen=65 || as_public)
+    // followed by the RFC ciphertext.
+    const asPubRaw = b64urlDecode(RFC8291_A.as_public)
+    const expectedHeader = concat([
+      b64urlDecode(RFC8291_A.salt),
+      new Uint8Array([0x00, 0x00, 0x10, 0x00, 65]),
+      asPubRaw,
+    ])
+    expect(expectedHeader.length).toBe(86)
+    const expected = concat([expectedHeader, b64urlDecode(RFC8291_A.ciphertext)])
+    expect(bytes).toEqual(expected)
+  })
+
+  it('verifies the VAPID JWT signature independently with the public key', async () => {
+    const vapidKeys = await crypto.subtle.generateKey(
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['sign', 'verify'],
+    )
+    const vapidJwk = await crypto.subtle.exportKey('jwk', vapidKeys.privateKey)
+    const vapidPublicRaw = new Uint8Array([
+      0x04,
+      ...b64urlDecode(vapidJwk.x!),
+      ...b64urlDecode(vapidJwk.y!),
+    ])
+    let captured: { headers: Record<string, string> } | undefined
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: { headers: Record<string, string> }) => {
+        captured = { headers: init.headers }
+        return new Response(null, { status: 201 })
+      }),
+    )
+    try {
+      await sendWebPush(
+        {
+          publicKey: b64urlEncode(vapidPublicRaw),
+          privateKey: vapidJwk.d!,
+          subject: 'https://store-resolve.moogzie.workers.dev',
+        },
+        {
+          endpoint: 'https://push.example.invalid/sub/vapid-1',
+          p256dh: RFC8291_A.ua_public,
+          auth: RFC8291_A.auth_secret,
+        },
+        { title: 't', body: 'b', url: '/' },
+      )
+      const authz = captured!.headers['Authorization']
+      const match = /^vapid t=([^,]+), k=([A-Za-z0-9_-]+)$/.exec(authz)
+      expect(match).toBeTruthy()
+      const [, jwt, keyParam] = match!
+      expect(keyParam).toBe(b64urlEncode(vapidPublicRaw))
+      const [h, p, s] = jwt.split('.')
+      // Claims.
+      expect(JSON.parse(new TextDecoder().decode(b64urlDecode(h)))).toMatchObject({
+        typ: 'JWT',
+        alg: 'ES256',
+      })
+      const claims = JSON.parse(new TextDecoder().decode(b64urlDecode(p)))
+      expect(claims.aud).toBe('https://push.example.invalid')
+      expect(claims.sub).toBe('https://store-resolve.moogzie.workers.dev')
+      expect(claims.exp).toBeGreaterThan(Date.now() / 1000)
+      // Signature is raw P1363 r||s (64 bytes, not DER).
+      const sig = b64urlDecode(s)
+      expect(sig.length).toBe(64)
+      // Independent verification with the public key only.
+      const verifyKey = await crypto.subtle.importKey(
+        'jwk',
+        { kty: 'EC', crv: 'P-256', x: vapidJwk.x!, y: vapidJwk.y! },
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify'],
+      )
+      const valid = await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        verifyKey,
+        sig,
+        te.encode(`${h}.${p}`),
+      )
+      expect(valid).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
 
   it('encrypts a payload the subscription owner can decrypt (round-trip)', async () => {
     const clientKeys = await crypto.subtle.generateKey(
