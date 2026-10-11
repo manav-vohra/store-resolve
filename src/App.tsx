@@ -45,6 +45,23 @@ const fmt = (value?: string) =>
     : '—'
 const cx = (...x: (string | false | undefined)[]) => x.filter(Boolean).join(' ')
 
+// Deep links: `#/complaints/:id` opens the complaint detail view. Used by Web
+// Push notification taps (`notificationclick` → `clients.openWindow(url)`) and
+// shareable links. The hash keeps the URL stable behind Cloudflare Access and
+// requires no router changes.
+const parseComplaintHash = (): string | undefined => {
+  const match = /^#\/complaints\/([A-Za-z0-9-]+)\/?$/.exec(window.location.hash)
+  return match?.[1]
+}
+const syncHashForView = (next: string, id?: string) => {
+  if (next === 'detail' && id) {
+    const target = `#/complaints/${id}`
+    if (window.location.hash !== target) window.location.hash = target
+  } else if (window.location.hash.startsWith('#/complaints/')) {
+    history.replaceState(null, '', window.location.pathname + window.location.search)
+  }
+}
+
 function Badge({ children, tone = 'neutral' }: { children: React.ReactNode; tone?: string }) {
   return <span className={`badge ${tone}`}>{children}</span>
 }
@@ -80,6 +97,7 @@ export default function App() {
     setSelectedId(id)
     setSidebarOpen(false)
     window.scrollTo(0, 0)
+    syncHashForView(next, id)
   }
   const visibleComplaints =
     user.role === 'STORE_MANAGER'
@@ -112,6 +130,32 @@ export default function App() {
     )
     return () => window.clearInterval(timer)
   }, [loading])
+  // Deep-link handling: open `#/complaints/:id` on cold start (e.g. a push
+  // notification tap) and on in-app hash changes. Idempotent — re-runs are
+  // no-ops when the requested complaint is already open.
+  useEffect(() => {
+    if (loading) return
+    const openFromHash = () => {
+      const id = parseComplaintHash()
+      if (!id) return
+      const allowed =
+        user.role === 'STORE_MANAGER'
+          ? state.complaints.some((c) => c.id === id && c.assignedManagerId === user.id)
+          : state.complaints.some((c) => c.id === id)
+      if (!allowed) {
+        show('Complaint not found or not available to you')
+        return
+      }
+      if (view === 'detail' && selectedId === id) return
+      setView('detail')
+      setSelectedId(id)
+      setSidebarOpen(false)
+      window.scrollTo(0, 0)
+    }
+    openFromHash()
+    window.addEventListener('hashchange', openFromHash)
+    return () => window.removeEventListener('hashchange', openFromHash)
+  }, [loading, state.complaints, user, view, selectedId])
   if (loading)
     return (
       <div className="loading-screen">
