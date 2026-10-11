@@ -85,6 +85,43 @@ Codex could not run in this image: `codex-code-mode-host` is missing from
 fallback flag that only fixed trivial commands). Implemented directly instead.
 Recorded in `~/TOOLS.md`.
 
+## Crypto review fixes — 2026-10-11 (post-deploy audit)
+
+An independent review found two issues in `worker/webpush.ts`; both fixed,
+verified, and redeployed (version `c1a4e65e-d3ad-43bc-bf61-a92f37391c7f`).
+
+1. **RFC 8291 salt handling (real bug).** The per-message salt was written into
+   the header but never mixed into key derivation, and the HKDF steps misused
+   `deriveBits` with an empty salt. `derivePushKeys()` now mirrors the RFC 8291
+   §3.4 pseudocode step-for-step with explicit HMAC-SHA-256 operations:
+   `PRK = HMAC-SHA-256(salt, IKM)` uses the message salt. The old round-trip
+   test passed only because the test decoder duplicated the sender's wrong
+   derivation.
+2. **VAPID signature format.** Already handled: WebCrypto returns raw P1363
+   `r||s` (64 bytes); `derToRaw()` is a fallback for non-conforming runtimes
+   only. Confirmed under workerd.
+
+**Verification added:**
+- RFC 8291 Appendix A test vector: all intermediate values (`ecdh_secret`,
+  `prk_key`, `ikm`, `prk`, `cek`, `nonce`) and the full 86-octet-header +
+  ciphertext message reproduced byte-for-byte.
+- VAPID JWT verified independently with the public key (claims + signature).
+- Full push crypto run under `workerd` (real Workers runtime): 7/7 PASS.
+- Full suite: 184 passed, 1 skipped. Both builds clean.
+
+## Migration status and safety procedure
+
+- `0007_phase_c_operations.sql` is **intentionally deferred** — not approved,
+  not applied. It remains the only pending migration on remote D1.
+- `0008_push_subscriptions.sql` was applied remotely on 2026-10-11 via the
+  migrations system (0007 temporarily moved aside during apply, then restored).
+- **Safe procedure for future migrations:** before `wrangler d1 migrations
+  apply --remote`, run `wrangler d1 migrations list --remote` and confirm every
+  pending migration is approved. If an unapproved migration (like 0007) is
+  pending, move it out of `drizzle/` temporarily, apply, then restore it —
+  never apply it. `d1 execute --file` bypasses migration bookkeeping and must
+  not be used for schema changes.
+
 ## Next: real-device gate (Dad's iPhone)
 
 1. On iPhone Safari, open the production URL and sign in via Cloudflare Access.
