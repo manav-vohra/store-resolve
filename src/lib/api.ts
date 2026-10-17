@@ -143,9 +143,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
-  previewMail: (params: { start: string; end: string; top?: number; nextLink?: string }) => {
+  previewMail: (params: { start: string; end: string; top?: number; pageToken?: string }) => {
     const query = new URLSearchParams({ start: params.start, end: params.end, top: String(params.top ?? 50) })
-    if (params.nextLink) query.set('nextLink', params.nextLink)
+    if (params.pageToken) query.set('pageToken', params.pageToken)
     return request(
       `/admin/email/preview?${query.toString()}`,
       z.object({
@@ -177,7 +177,7 @@ export const api = {
             linkedComplaintId: z.string().nullable(),
           }),
         ),
-        nextLink: z.string().nullable(),
+        nextPageToken: z.string().nullable(),
       }),
     )
   },

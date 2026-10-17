@@ -16,7 +16,7 @@ export function CheckMailNow() {
   const [startDate, setStartDate] = useState('2026-10-10')
   const [endDate, setEndDate] = useState('2026-10-17')
   const [items, setItems] = useState<PreviewItem[]>([])
-  const [nextLink, setNextLink] = useState<string | null>(null)
+  const [nextPageToken, setNextPageToken] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [previewing, setPreviewing] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -36,14 +36,14 @@ export function CheckMailNow() {
     setPreviewing(true)
     try {
       const { start, end } = windowISO()
-      const result = await api.previewMail({ start, end, top: 50, nextLink: cursor })
+      const result = await api.previewMail({ start, end, top: 50, pageToken: cursor })
       if (cursor) {
         setItems((prev) => [...prev, ...result.items])
       } else {
         setItems(result.items)
         setSelected(new Set())
       }
-      setNextLink(result.nextLink)
+      setNextPageToken(result.nextPageToken)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Preview failed')
     } finally {
@@ -162,8 +162,8 @@ export function CheckMailNow() {
             </table>
           </div>
           <div className="form-row">
-            {nextLink && (
-              <button className="secondary" disabled={previewing} onClick={() => loadPreview(nextLink)}>
+            {nextPageToken && (
+              <button className="secondary" disabled={previewing} onClick={() => loadPreview(nextPageToken)}>
                 Load more
               </button>
             )}

@@ -1,7 +1,41 @@
 # Phase 1 — Controlled real-mail discovery (Check Mail Now)
 
 Date: 2026-10-17
-Status: Implemented, not yet deployed. No prod deploy, no real import, no sends.
+Status: Implemented + corrective patch (independent review findings), deployed 2026-10-17. No real import, no sends.
+
+## Corrective patch (independent review, 2026-10-17)
+
+1. **Graph pagination security.** `MicrosoftGraphProvider.request()` now validates
+   every URL before attaching the bearer token (`validateGraphRequestUrl()`):
+   relative paths must be `/me/…`, absolute URLs must be
+   `https://graph.microsoft.com/v1.0/me/…` (no port override, no userinfo, no
+   fragment, no traversal, no encoded traversal). External / malformed /
+   out-of-scope URLs are rejected with `MS_GRAPH_INVALID_URL`. Bearer tokens
+   are never sent to unvalidated URLs and never logged.
+2. **Inbox-only preview.** `listInboxPreviewPage()` now uses
+   `/me/mailFolders/inbox/messages`, never `/me/messages`. Continuation pages
+   remain Inbox-scoped: callers pass an opaque `pageToken` ($skiptoken), the
+   server rebuilds the Inbox URL with the same window filter. The API returns
+   `nextPageToken` only, never a full Graph URL. `?nextLink=` is rejected with
+   400. Sent Items / other folders can never become imports.
+3. **Delta filtering.** Graph message delta only supports an initial
+   `receivedDateTime ge` (or `gt`) filter, not a combined `ge + lt` expression.
+   `listInboxDeltaPage()` now sends only `ge`. The upper bound is enforced
+   locally in `runMailboxDiscovery()` (already did via `inWindow`).
+4. **Metadata-only delta.** Delta pages are metadata-only. `runMailboxDiscovery()`
+   now calls `fetchFullMessage(id)` for each in-window message before intake.
+   `DeltaDiscoveryClient` requires `fetchFullMessage()`; the live client uses
+   `provider.getMessage()`. Metadata-only records are never interpreted as
+   complete complaint bodies.
+5. **Preview pagination revalidation.** `importSelectedPreviewMessages()`
+   previously checked only the first 100 preview records. It now walks all
+   preview pages (up to 10 pages / 500 messages, early exit once all wanted
+   ids are found). If the window still has more pages after 10 and some wanted
+   ids were not found, it refuses with `WINDOW_TOO_LARGE_FOR_REVALIDATION`
+   instead of incorrectly rejecting valid selections.
+
+Tests: `tests/phase1-corrective.test.ts` (10 tests) covers all five fixes.
+Full suite: 205 passed, 1 skipped.
 
 ## Goal
 

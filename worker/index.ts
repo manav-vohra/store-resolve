@@ -347,7 +347,9 @@ app.get('/api/admin/email/readiness', async (c) => {
 })
 
 // Phase 1 — Check Mail Now preview. Read-only: no complaints, no cursor, no sends, no D1 writes.
-// Owner-only. Accepts ?start= &end= ISO, ?top= (1..100), ?nextLink= (opaque Graph paging cursor).
+// Owner-only. Accepts ?start= &end= ISO, ?top= (1..100), ?pageToken= (opaque $skiptoken).
+// Rejects ?nextLink= : browser-provided Graph URLs are never fetched. The
+// server rebuilds the Inbox URL from pageToken + window.
 app.get('/api/admin/email/preview', async (c) => {
   const user = c.get('user')
   if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
@@ -356,6 +358,8 @@ app.get('/api/admin/email/preview', async (c) => {
     return c.json(jsonError('Preview is only available in FAMILY_PILOT'), 409)
   const graph = emailProvider(c.env)
   if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  if (c.req.query('nextLink'))
+    return c.json(jsonError('Use pageToken, not nextLink'), 400)
   const start = c.req.query('start') || DEFAULT_PREVIEW_WINDOW.receivedStart
   const end = c.req.query('end') || DEFAULT_PREVIEW_WINDOW.receivedEnd
   const windowCheck = validatePreviewWindow(start, end)
@@ -367,14 +371,14 @@ app.get('/api/admin/email/preview', async (c) => {
       graph,
       { receivedStart: start, receivedEnd: end },
       top,
-      c.req.query('nextLink') || undefined,
+      c.req.query('pageToken') || undefined,
     )
     return c.json({
       ok: true,
       window: { receivedStart: start, receivedEnd: end },
       count: result.items.length,
       items: result.items,
-      nextLink: result.nextLink ?? null,
+      nextPageToken: result.nextPageToken ?? null,
     })
   } catch (error) {
     const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_FAILED'

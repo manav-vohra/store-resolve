@@ -138,6 +138,68 @@ const GRAPH_SCOPES = [
   'https://graph.microsoft.com/Mail.Send',
 ].join(' ')
 
+/**
+ * Validates a Graph request URL before any bearer token is attached.
+ * - Relative paths must start with /me/ and contain no traversal.
+ * - Absolute URLs must be https://graph.microsoft.com (no port override,
+ *   no userinfo, no fragment), path must start with /v1.0/me/, no traversal.
+ * - Rejects external, malformed, or out-of-scope URLs (e.g. /v1.0/users/,
+ *   /beta/, other hosts). Bearer tokens are never sent to unvalidated URLs.
+ * - Never logs the URL or token: callers must not include secrets in errors.
+ */
+export function validateGraphRequestUrl(path: string): string {
+  if (path.startsWith('/')) {
+    if (path.includes('..') || path.includes('\\'))
+      throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is invalid')
+    if (!path.startsWith('/me/'))
+      throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must target /me/')
+    return `${GRAPH_ROOT}${path}`
+  }
+  let url: URL
+  try {
+    url = new URL(path)
+  } catch {
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request URL is malformed')
+  }
+  if (url.protocol !== 'https:')
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must use https')
+  if (url.hostname !== 'graph.microsoft.com')
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request host is not trusted')
+  if (url.port !== '' && url.port !== '443')
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request port is not allowed')
+  if (url.username || url.password)
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must not include credentials')
+  if (url.hash)
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must not include a fragment')
+  if (!url.pathname.startsWith('/v1.0/me/'))
+    throw new EmailProviderError(
+      'MS_GRAPH_INVALID_URL',
+      'Graph request must target the /me/ mailbox scope',
+    )
+  if (url.pathname.includes('..') || url.pathname.includes('\\'))
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is invalid')
+  // Encoded traversal (e.g. %2e%2e) must not escape /me/ scope.
+  try {
+    const decoded = decodeURIComponent(url.pathname)
+    if (decoded.includes('..') || decoded.includes('\\'))
+      throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is invalid')
+  } catch (error) {
+    if (error instanceof EmailProviderError) throw error
+    throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is malformed')
+  }
+  return url.toString()
+}
+
+/** Extracts $skiptoken from a Graph nextLink without trusting its host/path. */
+export function extractSkiptoken(nextLink: string): string | null {
+  try {
+    const url = new URL(nextLink)
+    return url.searchParams.get('$skiptoken')
+  } catch {
+    return null
+  }
+}
+
 const htmlToText = (value: string) =>
   value
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -241,8 +303,11 @@ export class MicrosoftGraphProvider implements EmailProvider {
     const attempts = retryReads && method === 'GET' ? 3 : 1
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const token = await this.accessToken()
-      // Delta links returned by Graph are absolute URLs; request paths are relative.
-      const url = /^https?:\/\//i.test(path) ? path : `${GRAPH_ROOT}${path}`
+      // Validate before attaching the bearer token. Delta/next links from
+      // Graph are absolute URLs; all other callers use relative /me/ paths.
+      // Browser-provided URLs are never passed here directly — preview uses
+      // pageToken reconstruction (see listInboxPreviewPage).
+      const url = validateGraphRequestUrl(path)
       const response = await fetch(url, {
         ...init,
         headers: {
@@ -580,10 +645,12 @@ export class MicrosoftGraphProvider implements EmailProvider {
         $select: select,
         $top: '25',
       })
-      const filters: string[] = []
-      if (options?.receivedStart) filters.push(`receivedDateTime ge ${options.receivedStart}`)
-      if (options?.receivedEnd) filters.push(`receivedDateTime lt ${options.receivedEnd}`)
-      if (filters.length > 0) params.set('$filter', filters.join(' and '))
+      // Corrective fix: Graph message delta only supports an initial
+      // receivedDateTime ge (or gt) filter, not a combined ge + lt expression.
+      // Send only the lower bound to Graph; the caller enforces the upper
+      // bound locally (see runMailboxDiscovery inWindow check).
+      if (options?.receivedStart)
+        params.set('$filter', `receivedDateTime ge ${options.receivedStart}`)
       path = `/me/mailFolders/inbox/messages/delta?${params.toString()}`
     }
     const page = await this.request<{
@@ -599,24 +666,25 @@ export class MicrosoftGraphProvider implements EmailProvider {
   }
 
   /**
-   * Preview-only inbox listing for the Check Mail Now flow. Uses
-   * /me/messages (NOT delta), so it never advances the ingestion cursor.
-   * Returns metadata + bodyPreview (for classification) but never full
-   * bodies or headers. Read-only: no D1 writes, no sends, no cursor change.
+   * Preview-only INBOX listing for the Check Mail Now flow. Uses
+   * /me/mailFolders/inbox/messages (NOT /me/messages, NOT delta), so it
+   * never advances the ingestion cursor and never lists Sent Items or
+   * other folders. Returns metadata + bodyPreview (for classification) but
+   * never full bodies or headers. Read-only: no D1 writes, no sends, no
+   * cursor change.
+   *
+   * Pagination: callers pass an opaque pageToken ($skiptoken), never a
+   * browser-provided URL. The server rebuilds the Inbox URL with the same
+   * window filter + skiptoken, so a malicious nextLink cannot redirect the
+   * bearer token or widen scope. Returns nextPageToken (skiptoken) only,
+   * never a full Graph URL.
    */
   async listInboxPreviewPage(options: {
     receivedStart: string
     receivedEnd: string
     top?: number
-    nextLink?: string
-  }): Promise<{ messages: GraphMessage[]; nextLink?: string }> {
-    if (options.nextLink) {
-      const page = await this.request<{
-        value?: GraphMessage[]
-        '@odata.nextLink'?: string
-      }>(options.nextLink)
-      return { messages: page.value ?? [], nextLink: page['@odata.nextLink'] }
-    }
+    pageToken?: string
+  }): Promise<{ messages: GraphMessage[]; nextPageToken?: string }> {
     const select = [
       'id',
       'conversationId',
@@ -636,11 +704,21 @@ export class MicrosoftGraphProvider implements EmailProvider {
       $orderby: 'receivedDateTime desc',
       $top: String(Math.max(1, Math.min(100, options.top ?? 50))),
     })
+    if (options.pageToken) {
+      // Rebuild the Inbox URL with the same window + skiptoken. The token
+      // itself is opaque; we never trust a browser-supplied host/path.
+      if (options.pageToken.length > 4096 || /[\r\n]/.test(options.pageToken))
+        throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+      params.set('$skiptoken', options.pageToken)
+    }
     const page = await this.request<{
       value?: GraphMessage[]
       '@odata.nextLink'?: string
-    }>(`/me/messages?${params.toString()}`)
-    return { messages: page.value ?? [], nextLink: page['@odata.nextLink'] }
+    }>(`/me/mailFolders/inbox/messages?${params.toString()}`)
+    const nextPageToken = page['@odata.nextLink']
+      ? extractSkiptoken(page['@odata.nextLink'])
+      : null
+    return { messages: page.value ?? [], nextPageToken: nextPageToken ?? undefined }
   }
 
   async listMessageIds(lookbackDays: number, maxResults = 25): Promise<string[]> {    const since = new Date(

@@ -26,12 +26,18 @@ import {
   type MicrosoftGraphProvider,
 } from './microsoft-graph'
 
-/** Minimal delta-page client so tests never touch the network. */
+/**
+ * Minimal delta-page client so tests never touch the network.
+ * Delta pages are metadata-only; fetchFullMessage() must be called for
+ * each message selected for intake before it reaches ingestEmailMessage().
+ * Metadata-only records must never be interpreted as complete bodies.
+ */
 export interface DeltaDiscoveryClient {
   fetchDeltaPage(
     link?: string,
     options?: { receivedStart?: string; receivedEnd?: string },
   ): Promise<InboxDeltaPage>
+  fetchFullMessage(id: string): Promise<NormalizedEmailMessage>
 }
 
 /** Live client: thin wrapper over the real Graph provider. */
@@ -43,17 +49,29 @@ export class GraphDeltaDiscoveryClient implements DeltaDiscoveryClient {
   ): Promise<InboxDeltaPage> {
     return this.provider.listInboxDeltaPage(link, options)
   }
+  fetchFullMessage(id: string): Promise<NormalizedEmailMessage> {
+    return this.provider.getMessage(id)
+  }
 }
 
 /** Fake client for tests: replays canned pages. */
 export class FakeDeltaDiscoveryClient implements DeltaDiscoveryClient {
   public calls: Array<string | undefined> = []
+  public fullFetchIds: string[] = []
   constructor(private readonly pages: InboxDeltaPage[]) {}
   async fetchDeltaPage(link?: string): Promise<InboxDeltaPage> {
     this.calls.push(link)
     const page = this.pages[this.calls.length - 1]
     if (!page) throw new EmailProviderError('FAKE_DELTA_EXHAUSTED', 'no more fake pages')
     return page
+  }
+  async fetchFullMessage(id: string): Promise<NormalizedEmailMessage> {
+    this.fullFetchIds.push(id)
+    for (const page of this.pages) {
+      const found = page.messages.find((m) => m.id === id)
+      if (found) return normalizeGraphMessage(found)
+    }
+    throw new EmailProviderError('FAKE_MESSAGE_NOT_FOUND', `no fake message ${id}`)
   }
 }
 
@@ -257,9 +275,9 @@ export async function runMailboxDiscovery(
           result.skipped += 1
           continue
         }
-        let normalized: NormalizedEmailMessage
+        let metadata: NormalizedEmailMessage
         try {
-          normalized = normalizeGraphMessage(graphMessage)
+          metadata = normalizeGraphMessage(graphMessage)
         } catch {
           result.failures += 1
           if (graphMessage.id) result.failedIds.push(graphMessage.id)
@@ -267,17 +285,30 @@ export async function runMailboxDiscovery(
         }
         // Enforce the date window client-side even if Graph ignored $filter.
         // Out-of-window mail is skipped, not ingested, not a failure.
-        if (!inWindow(normalized.internalDate)) {
+        if (!inWindow(metadata.internalDate)) {
           result.skipped += 1
           continue
         }
-        if (!highWater || normalized.internalDate > highWater) highWater = normalized.internalDate
+        if (!highWater || metadata.internalDate > highWater) highWater = metadata.internalDate
+        // Metadata-only delta fix: fetch the full message (body + headers)
+        // before intake. Never pass metadata-only records to
+        // ingestEmailMessage() — an empty textBody would be misinterpreted
+        // as a complete complaint body.
+        let full: NormalizedEmailMessage
+        try {
+          full = await options.client.fetchFullMessage(metadata.id)
+        } catch {
+          result.discovered += 1
+          result.failures += 1
+          result.failedIds.push(metadata.id)
+          continue
+        }
         // The intake path owns source persistence (INSERT OR IGNORE +
         // lease/resume logic). Discovery only hands the message over and
         // derives its counts from the intake status: a DUPLICATE means the
         // message was already seen, anything else means it was ingested.
         try {
-          const outcome = await ingest(db, normalized)
+          const outcome = await ingest(db, full)
           if (outcome.status === 'DUPLICATE') {
             result.skipped += 1
           } else {
@@ -287,7 +318,7 @@ export async function runMailboxDiscovery(
         } catch {
           result.discovered += 1
           result.failures += 1
-          result.failedIds.push(normalized.id)
+          result.failedIds.push(full.id)
         }
       }
       if (delta.deltaLink) {

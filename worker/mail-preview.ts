@@ -244,13 +244,13 @@ export async function runMailPreview(
   provider: MicrosoftGraphProvider,
   window: PreviewWindow,
   top = 50,
-  nextLink?: string,
-): Promise<{ items: MailPreviewItem[]; nextLink?: string }> {
+  pageToken?: string,
+): Promise<{ items: MailPreviewItem[]; nextPageToken?: string }> {
   const page = await provider.listInboxPreviewPage({
     receivedStart: window.receivedStart,
     receivedEnd: window.receivedEnd,
     top,
-    nextLink,
+    pageToken,
   })
   const messages = page.messages.filter((m) => m.id && m.receivedDateTime)
   // First pass: extract case ids for batch D1 lookup.
@@ -292,7 +292,7 @@ export async function runMailPreview(
       ...classification,
     }
   })
-  return { items, nextLink: page.nextLink }
+  return { items, nextPageToken: page.nextPageToken }
 }
 
 /** Result for one imported message. Never silently drops a failure. */
@@ -307,8 +307,12 @@ export interface PreviewImportResult {
 /**
  * Imports explicitly selected messages. Each id is re-validated against a
  * fresh preview listing for the same window (prevents forged ids outside the
- * window). Per-message failures are returned, not swallowed; other messages
- * still import. No cursor is advanced (preview uses /me/messages, not delta).
+ * window). Revalidation walks ALL preview pages (up to 10 pages, 500
+ * messages) so selections from later pages are not incorrectly rejected.
+ * If the window still has more pages after 10, revalidation fails with
+ * WINDOW_TOO_LARGE_FOR_REVALIDATION — the owner must narrow the window.
+ * Per-message failures are returned, not swallowed; other messages still
+ * import. No cursor is advanced (preview uses Inbox listing, not delta).
  */
 export async function importSelectedPreviewMessages(
   db: D1Database,
@@ -322,10 +326,28 @@ export async function importSelectedPreviewMessages(
   const uniqueIds = Array.from(new Set(messageIds)).slice(0, 50)
   if (uniqueIds.length === 0) return { results: [], imported: 0, failed: 0 }
 
-  // Re-validate: fresh preview listing for the window (up to 100). If a
-  // selected id is not in the window, it is a failure, not an import.
-  const preview = await runMailPreview(db, provider, window, 100)
-  const inWindow = new Set(preview.items.map((i) => i.graphMessageId))
+  // Re-validate: walk all preview pages for the window. The wanted set is
+  // small (<=50), so we stop early once all wanted ids are found.
+  const wanted = new Set(uniqueIds)
+  const inWindow = new Set<string>()
+  let pageToken: string | undefined
+  let truncated = false
+  for (let page = 0; page < 10; page += 1) {
+    const preview = await runMailPreview(db, provider, window, 50, pageToken)
+    for (const item of preview.items) {
+      if (wanted.has(item.graphMessageId)) inWindow.add(item.graphMessageId)
+    }
+    if (inWindow.size === wanted.size) break
+    if (!preview.nextPageToken) break
+    pageToken = preview.nextPageToken
+    if (page === 9 && preview.nextPageToken) truncated = true
+  }
+  if (truncated && inWindow.size !== wanted.size) {
+    // Window has more than 500 messages and some wanted ids were not found
+    // in the first 500: refuse rather than incorrectly rejecting valid
+    // selections as NOT_IN_PREVIEW_WINDOW.
+    throw new Error('WINDOW_TOO_LARGE_FOR_REVALIDATION')
+  }
   const results: PreviewImportResult[] = []
   let imported = 0
   let failed = 0
