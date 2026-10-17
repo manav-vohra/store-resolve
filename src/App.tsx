@@ -30,6 +30,7 @@ import {
 } from './lib/push'
 import ReviewQueue from './ReviewQueue'
 import { CheckMailNow } from './components/CheckMailNow'
+import { ManualAck } from './components/ManualAck'
 import { fixtures, initialState } from './lib/seed'
 import type { AppState, Complaint, IntegrationHealth, NewComplaint, Severity } from './lib/types'
 
@@ -959,6 +960,12 @@ function ComplaintDetail({
             <span>Customer complaint</span>
             <p>{c.complaintText}</p>
           </section>
+          <ManualAck
+            complaintId={c.id}
+            source={c.source}
+            acknowledgementStatus={c.acknowledgementStatus}
+            isOwner={current.role === 'OWNER' || current.role === 'ADMIN'}
+          />
           {!c.storeId && (
             <section className="routing-alert">
               <AlertTriangle />

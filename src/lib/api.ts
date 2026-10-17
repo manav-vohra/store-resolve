@@ -181,6 +181,46 @@ export const api = {
       }),
     )
   },
+  ackPreview: (complaintId: string) =>
+    request(
+      `/complaints/${encodeURIComponent(complaintId)}/acknowledge-preview`,
+      z.object({
+        ok: z.literal(true),
+        complaintId: z.string(),
+        externalCaseId: z.string().nullable(),
+        complaintStatus: z.string(),
+        acknowledgementStatus: z.string(),
+        source: z.object({
+          sender: z.string(),
+          subject: z.string(),
+          threadIdMasked: z.string(),
+          internalDate: z.string(),
+        }),
+        template: z.string(),
+        ack: z
+          .object({
+            status: z.string(),
+            attempt_count: z.number(),
+            last_error_code: z.string().nullable(),
+            updated_at: z.string(),
+          })
+          .nullable(),
+        mailbox: z.object({ matches: z.boolean(), reason: z.string().nullable() }).nullable(),
+        canSend: z.boolean(),
+      }),
+    ),
+  ackSend: (complaintId: string) =>
+    request(
+      `/complaints/${encodeURIComponent(complaintId)}/acknowledge`,
+      z.object({ ok: z.boolean(), result: z.string() }),
+      { method: 'POST', body: JSON.stringify({ confirmed: true }) },
+    ),
+  ackReclaim: (complaintId: string, body: { checkedSentItems: true; sentConfirmed: boolean }) =>
+    request(
+      `/complaints/${encodeURIComponent(complaintId)}/acknowledge/reclaim`,
+      z.object({ ok: z.boolean(), result: z.string() }),
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
   importPreviewMail: (body: {
     messageIds: string[]
     receivedStart: string

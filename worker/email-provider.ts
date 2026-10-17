@@ -12,12 +12,29 @@ export interface NormalizedEmailMessage {
   htmlBody?: string
 }
 
+export interface MailboxIdentity {
+  id: string
+  displayName: string
+  mail: string | null
+  userPrincipalName: string | null
+}
+
+export interface MailboxIdentityVerification {
+  matches: boolean
+  actual: MailboxIdentity
+  expected: string | null
+  reason: string | null
+}
+
 export interface EmailProvider {
   readonly ready: boolean
   verifyConnection(): Promise<void>
   listMessageIds(lookbackDays: number, maxResults?: number): Promise<string[]>
   getMessage(id: string): Promise<NormalizedEmailMessage>
   sendAcknowledgment(message: NormalizedEmailMessage, body: string): Promise<string | undefined>
+  /** Phase 2: Graph /me identity. Optional — only MicrosoftGraphProvider implements it. */
+  getMailboxIdentity?: () => Promise<MailboxIdentity>
+  verifyMailboxIdentity?: (expectedMailbox: string | undefined) => Promise<MailboxIdentityVerification>
 }
 
 export class EmailProviderError extends Error {

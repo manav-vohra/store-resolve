@@ -1002,20 +1002,71 @@ export async function ingestEmailMessage(
 export const neutralAcknowledgment =
   'We have received this complaint and are reviewing it with the appropriate location. We will follow up as needed.'
 
+export type AcknowledgeResult =
+  | 'DISABLED'
+  | 'SENT'
+  | 'ALREADY_HANDLED'
+  | 'FAILED'
+  | 'AMBIGUOUS'
+  | 'IN_FLIGHT_STALE'
+  | 'MAILBOX_NOT_VERIFIED'
+  | 'NO_SOURCE'
+
+export interface AcknowledgeOptions {
+  /** Manual pilot: explicit owner action. Does NOT require emailAckEnabled. */
+  manual?: boolean
+  /** Allow retry from FAILED (manual only). Automatic path keeps FAILED terminal. */
+  allowRetryFromFailed?: boolean
+  /** Caller must have verified mailbox identity for manual sends. */
+  mailboxIdentityVerified?: boolean
+}
+
+const STALE_IN_FLIGHT_MS = 15 * 60_000
+
+/** True when a send error is ambiguous (Graph may have accepted). Never auto-retry these. */
+function isAmbiguousSendError(error: unknown): boolean {
+  if (error instanceof EmailProviderError) {
+    // 429 / 5xx: Graph may have accepted before failing. Timeout / network: same.
+    if (error.status === 429) return true
+    if (error.status !== undefined && error.status >= 500) return true
+    if (error.code.includes('TIMEOUT') || error.code.includes('TEMPORARY')) return true
+    if (error.code.includes('RETRY_EXHAUSTED')) return true
+    return false
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : ''
+  return (
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('network') ||
+    message.includes('fetch failed') ||
+    message.includes('aborted') ||
+    message.includes('econnreset') ||
+    message.includes('socket')
+  )
+}
+
 export async function acknowledgeComplaint(
   db: D1Database,
   emailProvider: EmailProvider,
   complaintId: string,
   config: AppConfig,
-): Promise<'DISABLED' | 'SENT' | 'ALREADY_HANDLED' | 'FAILED'> {
-  if (!config.emailAckEnabled) return 'DISABLED'
+  options: AcknowledgeOptions = {},
+): Promise<AcknowledgeResult> {
+  // Manual pilot: explicit owner action does NOT require the global automatic
+  // switch, but DOES require mailbox identity verification. Automatic path
+  // requires the switch and never retries FAILED.
+  if (options.manual) {
+    if (!options.mailboxIdentityVerified) return 'MAILBOX_NOT_VERIFIED'
+  } else if (!config.emailAckEnabled) {
+    return 'DISABLED'
+  }
   const source = await db
     .prepare(
       `SELECT gm.*,c.acknowledgement_status FROM gmail_messages gm JOIN complaints c ON c.id=gm.complaint_id WHERE gm.complaint_id=? AND gm.is_follow_up=0 ORDER BY gm.first_seen_at LIMIT 1`,
     )
     .bind(complaintId)
     .first<Record<string, unknown>>()
-  if (!source) return 'FAILED'
+  if (!source) return 'NO_SOURCE'
   const idempotencyKey = `email-ack:${complaintId}`
   const now = new Date().toISOString()
   await db
@@ -1033,10 +1084,29 @@ export async function acknowledgeComplaint(
     )
     .run()
   const acknowledgment = await db
-    .prepare('SELECT id,status FROM email_acknowledgments WHERE complaint_id=?')
+    .prepare('SELECT id,status,updated_at,attempt_count,last_error_code FROM email_acknowledgments WHERE complaint_id=?')
     .bind(complaintId)
-    .first<{ id: string; status: string }>()
-  if (!acknowledgment || acknowledgment.status !== 'PENDING') return 'ALREADY_HANDLED'
+    .first<{ id: string; status: string; updated_at: string; attempt_count: number; last_error_code: string | null }>()
+  if (!acknowledgment) return 'ALREADY_HANDLED'
+  // SENT: never send again.
+  if (acknowledgment.status === 'SENT') return 'ALREADY_HANDLED'
+  // IN_FLIGHT: fresh = another worker owns it; stale = caller must reclaim manually.
+  if (acknowledgment.status === 'IN_FLIGHT') {
+    const ageMs = Date.parse(now) - Date.parse(acknowledgment.updated_at)
+    if (ageMs < STALE_IN_FLIGHT_MS) return 'ALREADY_HANDLED'
+    return 'IN_FLIGHT_STALE'
+  }
+  // FAILED: automatic path keeps it terminal. Manual path may retry with explicit approval.
+  if (acknowledgment.status === 'FAILED') {
+    if (!options.manual || !options.allowRetryFromFailed) return 'ALREADY_HANDLED'
+    // Reset to PENDING, preserving attempt_count (it increments on next IN_FLIGHT).
+    await db
+      .prepare(`UPDATE email_acknowledgments SET status='PENDING',last_error_code=NULL,updated_at=? WHERE id=? AND status='FAILED'`)
+      .bind(now, acknowledgment.id)
+      .run()
+    acknowledgment.status = 'PENDING'
+  }
+  if (acknowledgment.status !== 'PENDING') return 'ALREADY_HANDLED'
   await db
     .prepare(
       `UPDATE email_acknowledgments SET status='IN_FLIGHT',attempt_count=attempt_count+1,updated_at=? WHERE id=? AND status='PENDING'`,
@@ -1055,8 +1125,41 @@ export async function acknowledgeComplaint(
     references: source.references_header ? String(source.references_header) : undefined,
     textBody: '',
   }
+  // Separate Graph send from D1 commit: if Graph accepts (202) but D1 commit
+  // fails, the row must stay IN_FLIGHT (ambiguous), not FAILED — otherwise a
+  // retry would send a second reply.
+  let providerMessageId: string | undefined
   try {
-    const providerMessageId = await emailProvider.sendAcknowledgment(message, neutralAcknowledgment)
+    providerMessageId = await emailProvider.sendAcknowledgment(message, neutralAcknowledgment)
+  } catch (error) {
+    if (isAmbiguousSendError(error)) {
+      // Ambiguous: Graph may have accepted. Keep IN_FLIGHT, do NOT auto-retry.
+      // Owner must check Sent Items and reclaim manually.
+      const code = error instanceof EmailProviderError ? error.code : 'AMBIGUOUS_SEND'
+      const ambiguousAt = new Date().toISOString()
+      await db
+        .prepare(`UPDATE email_acknowledgments SET last_error_code=?,updated_at=? WHERE id=?`)
+        .bind(`AMBIGUOUS:${code}`, ambiguousAt, acknowledgment.id)
+        .run()
+      await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_AMBIGUOUS', complaintId, 'AMBIGUOUS', code)
+      return 'AMBIGUOUS'
+    }
+    const code = error instanceof EmailProviderError ? error.code : 'MS_GRAPH_SEND_UNKNOWN'
+    const failedAt = new Date().toISOString()
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE email_acknowledgments SET status='FAILED',last_error_code=?,updated_at=? WHERE id=?`,
+        )
+        .bind(code, failedAt, acknowledgment.id),
+      db
+        .prepare(`UPDATE complaints SET acknowledgement_status='FAILED',updated_at=? WHERE id=?`)
+        .bind(failedAt, complaintId),
+    ])
+    await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_FAILED', complaintId, 'FAILED', code)
+    return 'FAILED'
+  }
+  try {
     const sentAt = new Date().toISOString()
     await db.batch([
       db
@@ -1082,27 +1185,80 @@ export async function acknowledgeComplaint(
           crypto.randomUUID(),
           complaintId,
           sentAt,
-          JSON.stringify({ provider: 'MICROSOFT_GRAPH', providerMessageId }),
+          JSON.stringify({ provider: 'MICROSOFT_GRAPH', providerMessageId, manual: options.manual ?? false }),
         ),
     ])
     await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_SENT', complaintId, 'SUCCESS')
     return 'SENT'
-  } catch (error) {
-    const code = error instanceof EmailProviderError ? error.code : 'MS_GRAPH_SEND_UNKNOWN'
+  } catch {
+    // Graph accepted (202) but D1 commit failed: ambiguous, stay IN_FLIGHT.
+    // Never mark FAILED here — a retry would send a duplicate reply.
     const failedAt = new Date().toISOString()
+    await db
+      .prepare(`UPDATE email_acknowledgments SET last_error_code=?,updated_at=? WHERE id=?`)
+      .bind('AMBIGUOUS:COMMIT_FAILED', failedAt, acknowledgment.id)
+      .run()
+    await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_AMBIGUOUS', complaintId, 'AMBIGUOUS', 'COMMIT_FAILED')
+    return 'AMBIGUOUS'
+  }
+}
+
+export type ReclaimAckResult =
+  | 'RECLAIMED_SENT'
+  | 'RECLAIMED_TO_PENDING'
+  | 'NOT_IN_FLIGHT'
+  | 'IN_FLIGHT_FRESH'
+  | 'NEEDS_SENT_ITEMS_CHECK'
+
+/**
+ * Manual reclaim for stale IN_FLIGHT acks. The owner must have checked Graph
+ * Sent Items / the thread and reports whether the reply is actually there.
+ * - sentConfirmed=true: mark SENT without sending again (no duplicate reply).
+ * - sentConfirmed=false: reset to PENDING so a manual retry can be attempted.
+ * Never auto-reclaims, never sends.
+ */
+export async function reclaimStaleAck(
+  db: D1Database,
+  complaintId: string,
+  options: { checkedSentItems: boolean; sentConfirmed: boolean },
+): Promise<ReclaimAckResult> {
+  if (!options.checkedSentItems) return 'NEEDS_SENT_ITEMS_CHECK'
+  const row = await db
+    .prepare('SELECT id,status,updated_at FROM email_acknowledgments WHERE complaint_id=?')
+    .bind(complaintId)
+    .first<{ id: string; status: string; updated_at: string }>()
+  if (!row || row.status !== 'IN_FLIGHT') return 'NOT_IN_FLIGHT'
+  const ageMs = Date.parse(new Date().toISOString()) - Date.parse(row.updated_at)
+  if (ageMs < STALE_IN_FLIGHT_MS) return 'IN_FLIGHT_FRESH'
+  const now = new Date().toISOString()
+  if (options.sentConfirmed) {
+    const source = await db
+      .prepare(`SELECT gmail_message_id FROM gmail_messages WHERE complaint_id=? AND is_follow_up=0 ORDER BY first_seen_at LIMIT 1`)
+      .bind(complaintId)
+      .first<{ gmail_message_id: string }>()
     await db.batch([
       db
-        .prepare(
-          `UPDATE email_acknowledgments SET status='FAILED',last_error_code=?,updated_at=? WHERE id=?`,
-        )
-        .bind(code, failedAt, acknowledgment.id),
+        .prepare(`UPDATE email_acknowledgments SET status='SENT',sent_at=?,updated_at=? WHERE id=? AND status='IN_FLIGHT'`)
+        .bind(now, now, row.id),
       db
-        .prepare(`UPDATE complaints SET acknowledgement_status='FAILED',updated_at=? WHERE id=?`)
-        .bind(failedAt, complaintId),
+        .prepare(`UPDATE complaints SET dunkin_acknowledged_at=?,acknowledgement_status='SENT',acknowledgment_body=?,updated_at=? WHERE id=?`)
+        .bind(now, neutralAcknowledgment, now, complaintId),
+      ...(source
+        ? [db.prepare(`UPDATE gmail_messages SET acknowledgment_status='SENT',updated_at=? WHERE gmail_message_id=?`).bind(now, source.gmail_message_id)]
+        : []),
+      db
+        .prepare(`INSERT INTO complaint_events(id,complaint_id,event_type,actor,timestamp,metadata) VALUES(?,?,'DUNKIN_ACKNOWLEDGED','microsoft-graph',?,?)`)
+        .bind(crypto.randomUUID(), complaintId, now, JSON.stringify({ reclaimed: true, via: 'SENT_ITEMS_CHECK' })),
     ])
-    await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_FAILED', complaintId, 'FAILED', code)
-    return 'FAILED'
+    await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_RECLAIMED_SENT', complaintId, 'SUCCESS')
+    return 'RECLAIMED_SENT'
   }
+  await db.batch([
+    db.prepare(`UPDATE email_acknowledgments SET status='PENDING',last_error_code=NULL,updated_at=? WHERE id=? AND status='IN_FLIGHT'`).bind(now, row.id),
+    db.prepare(`UPDATE complaints SET acknowledgement_status='PENDING',updated_at=? WHERE id=?`).bind(now, complaintId),
+  ])
+  await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_RECLAIMED_PENDING', complaintId, 'SUCCESS')
+  return 'RECLAIMED_TO_PENDING'
 }
 
 export async function pollEmail(

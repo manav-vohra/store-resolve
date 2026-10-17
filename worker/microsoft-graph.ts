@@ -1,6 +1,8 @@
 import {
   EmailProviderError,
   type EmailProvider,
+  type MailboxIdentity,
+  type MailboxIdentityVerification,
   type NormalizedEmailMessage,
 } from './email-provider'
 
@@ -357,6 +359,57 @@ export class MicrosoftGraphProvider implements EmailProvider {
         'MS_GRAPH_INVALID_MAILBOX_METADATA',
         'Microsoft Graph Inbox metadata is incomplete',
       )
+  }
+
+  /**
+   * Phase 2 — Mailbox identity proof. Returns the Graph /me identity for
+   * the authorized token: id, displayName, mail, userPrincipalName.
+   * This is stronger than Inbox folder metadata (which only proves a
+   * mailbox is reachable, not whose mailbox it is). Manual ack requires
+   * this identity to match the expected complaint mailbox (MS_MAILBOX_ADDRESS).
+   */
+  async getMailboxIdentity(): Promise<MailboxIdentity> {
+    const me = await this.request<{
+      id?: string
+      displayName?: string
+      mail?: string | null
+      userPrincipalName?: string | null
+    }>('/me?$select=id,displayName,mail,userPrincipalName')
+    if (!me.id || !me.displayName)
+      throw new EmailProviderError(
+        'MS_GRAPH_INVALID_MAILBOX_IDENTITY',
+        'Microsoft Graph /me identity is incomplete',
+      )
+    return {
+      id: me.id,
+      displayName: me.displayName,
+      mail: me.mail ?? null,
+      userPrincipalName: me.userPrincipalName ?? null,
+    }
+  }
+
+  /**
+   * Verifies the authorized token belongs to the expected complaint mailbox.
+   * Matches on mail or userPrincipalName (case-insensitive). Returns the
+   * actual identity + expected + match flag. Callers must refuse to send
+   * when matches=false.
+   */
+  async verifyMailboxIdentity(expectedMailbox: string | undefined): Promise<MailboxIdentityVerification> {
+    const actual = await this.getMailboxIdentity()
+    const expected = expectedMailbox?.trim() || null
+    if (!expected) {
+      return { matches: false, actual, expected: null, reason: 'NO_EXPECTED_MAILBOX' }
+    }
+    const lowerExpected = expected.toLowerCase()
+    const matches =
+      (actual.mail?.toLowerCase() === lowerExpected) ||
+      (actual.userPrincipalName?.toLowerCase() === lowerExpected)
+    return {
+      matches,
+      actual,
+      expected,
+      reason: matches ? null : 'MAILBOX_MISMATCH',
+    }
   }
 
   async findPilotComplaintCandidates(): Promise<{

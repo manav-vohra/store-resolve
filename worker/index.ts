@@ -35,7 +35,13 @@ import {
 import { buildPilotUniquenessReport } from './pilot-uniqueness'
 import { buildPilotBodyDiagnosticReport } from './pilot-body-diagnostic'
 import { EmailProviderError } from './email-provider'
-import { ingestApprovedPilotCasePair, ingestSinglePilotComplaint } from './ingestion'
+import {
+  acknowledgeComplaint,
+  ingestApprovedPilotCasePair,
+  ingestSinglePilotComplaint,
+  neutralAcknowledgment,
+  reclaimStaleAck,
+} from './ingestion'
 import { GraphDeltaDiscoveryClient, runMailboxDiscovery } from './mail-discovery'
 import {
   DEFAULT_PREVIEW_WINDOW,
@@ -436,6 +442,180 @@ app.post('/api/admin/email/preview-import', async (c) => {
     const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_IMPORT_FAILED'
     return c.json(jsonError(code), 503)
   }
+})
+
+// Phase 2 — Mailbox identity proof. Owner-only, read-only. Returns the Graph
+// /me identity for the authorized token + whether it matches the expected
+// complaint mailbox (MS_MAILBOX_ADDRESS). Inbox metadata alone is NOT proof.
+app.get('/api/admin/email/mailbox-identity', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const graph = emailProvider(c.env)
+  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  if (typeof graph.getMailboxIdentity !== 'function')
+    return c.json(jsonError('MAILBOX_IDENTITY_NOT_SUPPORTED'), 503)
+  try {
+    const result = await graph.verifyMailboxIdentity(c.env.MS_MAILBOX_ADDRESS)
+    return c.json({
+      ok: true,
+      matches: result.matches,
+      actual: {
+        displayName: result.actual.displayName,
+        mail: result.actual.mail ? maskEmail(result.actual.mail) : null,
+        userPrincipalName: result.actual.userPrincipalName ? maskEmail(result.actual.userPrincipalName) : null,
+      },
+      expected: result.expected ? maskEmail(result.expected) : null,
+      reason: result.reason,
+    })
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'MAILBOX_IDENTITY_FAILED'
+    return c.json(jsonError(code), 503)
+  }
+})
+
+// Phase 2 — Manual ack preview. Owner-only, read-only. Shows the exact
+// template, intended recipient/thread, mailbox identity, and ack status
+// before any send. No D1 writes, no sends.
+app.get('/api/complaints/:id/acknowledge-preview', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const state = await loadState(c.env.DB)
+  if (state.config.mode !== 'FAMILY_PILOT' || state.config.externalNotificationsEnabled)
+    return c.json(jsonError('Production safety controls must remain locked down'), 409)
+  const complaintId = c.req.param('id')
+  const complaint = state.complaints.find((x) => x.id === complaintId)
+  if (!complaint) return c.json(jsonError('Complaint not found'), 404)
+  if (complaint.source !== 'MICROSOFT_GRAPH')
+    return c.json(jsonError('Only Graph-ingested complaints can be acknowledged'), 409)
+  const source = await c.env.DB
+    .prepare(`SELECT sender,subject,gmail_thread_id,gmail_message_id,internal_date FROM gmail_messages WHERE complaint_id=? AND is_follow_up=0 ORDER BY first_seen_at LIMIT 1`)
+    .bind(complaintId)
+    .first<{ sender: string; subject: string; gmail_thread_id: string; gmail_message_id: string; internal_date: string }>()
+  if (!source) return c.json(jsonError('No source Outlook message for this complaint'), 409)
+  const ack = await c.env.DB
+    .prepare(`SELECT status,attempt_count,last_error_code,updated_at FROM email_acknowledgments WHERE complaint_id=?`)
+    .bind(complaintId)
+    .first<{ status: string; attempt_count: number; last_error_code: string | null; updated_at: string }>()
+  let mailbox: { matches: boolean; reason: string | null } | null = null
+  const graph = emailProvider(c.env)
+  if (graph.ready && typeof graph.verifyMailboxIdentity === 'function') {
+    try {
+      const result = await graph.verifyMailboxIdentity(c.env.MS_MAILBOX_ADDRESS)
+      mailbox = { matches: result.matches, reason: result.reason }
+    } catch {
+      mailbox = { matches: false, reason: 'MAILBOX_IDENTITY_FAILED' }
+    }
+  }
+  return c.json({
+    ok: true,
+    complaintId: complaint.id,
+    externalCaseId: complaint.externalCaseId ?? null,
+    complaintStatus: complaint.status,
+    acknowledgementStatus: complaint.acknowledgementStatus,
+    source: {
+      sender: maskEmail(source.sender),
+      subject: source.subject.slice(0, 200),
+      threadIdMasked: maskGraphIdentifier(source.gmail_thread_id),
+      internalDate: source.internal_date,
+    },
+    template: neutralAcknowledgment,
+    ack: ack ?? null,
+    mailbox,
+    canSend: complaint.acknowledgementStatus !== 'SENT' && (mailbox?.matches ?? false),
+  })
+})
+
+// Phase 2 — Manual ack send. Owner-only, requires explicit confirmed=true,
+// FAMILY_PILOT, external OFF, mailbox identity match. Global automatic ack
+// switch stays OFF during manual pilot — this endpoint is the only send path.
+app.post('/api/complaints/:id/acknowledge', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const state = await loadState(c.env.DB)
+  if (state.config.mode !== 'FAMILY_PILOT' || state.config.externalNotificationsEnabled)
+    return c.json(jsonError('Production safety controls must remain locked down'), 409)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json(jsonError('Invalid JSON'), 400)
+  }
+  if (!z.object({ confirmed: z.literal(true) }).safeParse(body).success)
+    return c.json(jsonError('Explicit confirmation required (confirmed: true)'), 400)
+  const complaintId = c.req.param('id')
+  const complaint = state.complaints.find((x) => x.id === complaintId)
+  if (!complaint) return c.json(jsonError('Complaint not found'), 404)
+  if (complaint.source !== 'MICROSOFT_GRAPH')
+    return c.json(jsonError('Only Graph-ingested complaints can be acknowledged'), 409)
+  if (complaint.acknowledgementStatus === 'SENT')
+    return c.json(jsonError('Already acknowledged'), 409)
+  const graph = emailProvider(c.env)
+  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  if (typeof graph.verifyMailboxIdentity !== 'function')
+    return c.json(jsonError('MAILBOX_IDENTITY_NOT_SUPPORTED'), 503)
+  let identity: { matches: boolean; reason: string | null }
+  try {
+    identity = await graph.verifyMailboxIdentity(c.env.MS_MAILBOX_ADDRESS)
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'MAILBOX_IDENTITY_FAILED'
+    return c.json(jsonError(code), 503)
+  }
+  if (!identity.matches)
+    return c.json(jsonError(`Mailbox identity mismatch: ${identity.reason ?? 'UNKNOWN'}`), 409)
+  try {
+    const result = await acknowledgeComplaint(c.env.DB, graph, complaintId, state.config, {
+      manual: true,
+      allowRetryFromFailed: true,
+      mailboxIdentityVerified: true,
+    })
+    if (result === 'SENT') {
+      await auditAdminChange(c.env.DB, 'MANUAL_ACK_SENT', complaintId, user.id)
+      return c.json({ ok: true, result: 'SENT' })
+    }
+    if (result === 'AMBIGUOUS')
+      return c.json({ ok: false, result: 'AMBIGUOUS', error: 'Send outcome ambiguous — check Sent Items, then reclaim. No auto-retry.' }, 409)
+    if (result === 'IN_FLIGHT_STALE')
+      return c.json({ ok: false, result: 'IN_FLIGHT_STALE', error: 'A previous send is stale IN_FLIGHT — check Sent Items, then reclaim.' }, 409)
+    if (result === 'ALREADY_HANDLED')
+      return c.json({ ok: false, result: 'ALREADY_HANDLED', error: 'Acknowledgment already handled' }, 409)
+    if (result === 'NO_SOURCE')
+      return c.json(jsonError('No source Outlook message for this complaint'), 409)
+    if (result === 'MAILBOX_NOT_VERIFIED')
+      return c.json(jsonError('Mailbox identity not verified'), 409)
+    return c.json({ ok: false, result, error: `Acknowledgment failed: ${result}` }, 409)
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'ACK_SEND_FAILED'
+    return c.json(jsonError(code), 503)
+  }
+})
+
+// Phase 2 — Manual reclaim for stale IN_FLIGHT acks. Owner-only. Requires
+// checkedSentItems=true and sentConfirmed (owner checked Sent Items).
+// Never sends, never auto-retries.
+app.post('/api/complaints/:id/acknowledge/reclaim', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const state = await loadState(c.env.DB)
+  if (state.config.mode !== 'FAMILY_PILOT' || state.config.externalNotificationsEnabled)
+    return c.json(jsonError('Production safety controls must remain locked down'), 409)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json(jsonError('Invalid JSON'), 400)
+  }
+  const parsed = z
+    .object({ checkedSentItems: z.literal(true), sentConfirmed: z.boolean() })
+    .safeParse(body)
+  if (!parsed.success)
+    return c.json(jsonError('checkedSentItems: true and sentConfirmed (boolean) required'), 400)
+  const complaintId = c.req.param('id')
+  const result = await reclaimStaleAck(c.env.DB, complaintId, parsed.data)
+  if (result === 'RECLAIMED_SENT' || result === 'RECLAIMED_TO_PENDING') {
+    await auditAdminChange(c.env.DB, 'MANUAL_ACK_RECLAIM', complaintId, user.id)
+    return c.json({ ok: true, result })
+  }
+  return c.json({ ok: false, result, error: `Reclaim not allowed: ${result}` }, 409)
 })
 
 app.get('/api/admin/email/pilot-diagnostic', async (c) => {
