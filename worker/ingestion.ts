@@ -51,6 +51,10 @@ export type EmailProcessingStatus =
 
 export interface ComplaintExtraction {
   isComplaint: boolean
+  /** True when subject/body indicates a forward or reply (Fw/Fwd/Re, quoted original, etc.). */
+  isForwardOrReply: boolean
+  /** True when a case/reference ID signal is present (even if the outer text is short). */
+  hasCaseIdSignal: boolean
   externalCaseId?: string
   storeNumber?: string
   locationHint?: string
@@ -63,6 +67,22 @@ export interface ComplaintExtraction {
   details: string
   /** Which deterministic branches fired, in evaluation order (Phase B evidence). */
   extractionRules: string[]
+}
+
+/** Forward/reply markers in subject or body. Exported for preview classification. */
+export function isForwardOrReplyMessage(subject: string, textBody: string): boolean {
+  const subjectTrim = subject.trim().toLowerCase()
+  if (/^(fw|fwd|re|ré)\s*:/.test(subjectTrim)) return true
+  if (/^(fw|fwd|re)\s*\[.+\]/.test(subjectTrim)) return true
+  const body = textBody.slice(0, 2000).toLowerCase()
+  return (
+    body.includes('begin forwarded message') ||
+    body.includes('---original message---') ||
+    body.includes('-----original message-----') ||
+    body.includes('original message:') ||
+    body.includes('forwarded message') ||
+    (body.includes('on ') && body.includes('wrote:') && body.includes('from:'))
+  )
 }
 
 const compact = (value: string) => value.replace(/\s+/g, ' ').trim()
@@ -85,6 +105,15 @@ export function extractComplaint(message: NormalizedEmailMessage): ComplaintExtr
     if (hit) rules.push(rule)
     return hit
   }
+  const isForwardOrReply = isForwardOrReplyMessage(message.subject, message.textBody)
+  if (isForwardOrReply) rules.push('FORWARD_REPLY_MARKER')
+  const hasCaseIdSignal = /\bcase\s*[:#]\s*[A-Z0-9][A-Z0-9-]{1,}/i.test(combined)
+  if (hasCaseIdSignal) rules.push('HAS_CASE_ID_SIGNAL')
+  // Forward/reply carrying a case ID is a complaint candidate even when the
+  // outer text is just "FYI" / "See below" — the quoted original may hold the
+  // complaint. Rule is pushed unconditionally (not in the || chain) so it is
+  // recorded even when IS_CASE_REFERENCE already fired.
+  if (isForwardOrReply && hasCaseIdSignal) rules.push('FORWARD_REPLY_WITH_CASE_ID')
   const isComplaint =
     test(
       /\b(complaint|guest concern|customer concern|customer issue|case id|reference id|foreign object|food poison|allerg|injury|not happy|unhappy|disappointed|disgusting)\b/i,
@@ -93,7 +122,8 @@ export function extractComplaint(message: NormalizedEmailMessage): ComplaintExtr
     // "Case: DD-2024" / "Case #XYZ" style references are complaint identity
     // signals even without the word "complaint" (recall matters: a missed
     // complaint vanishes, an over-triaged one gets human review).
-    test(/\bcase\s*[:#]\s*[A-Z0-9][A-Z0-9-]{1,}/i, 'IS_CASE_REFERENCE')
+    test(/\bcase\s*[:#]\s*[A-Z0-9][A-Z0-9-]{1,}/i, 'IS_CASE_REFERENCE') ||
+    (isForwardOrReply && hasCaseIdSignal)
   let category: string
   if (test(/clean|sanit|bathroom|dirty/i, 'CATEGORY_CLEANLINESS')) category = 'Cleanliness'
   else if (test(/staff|employee|service|rude|wait/i, 'CATEGORY_SERVICE')) category = 'Service'
@@ -112,6 +142,8 @@ export function extractComplaint(message: NormalizedEmailMessage): ComplaintExtr
   }
   return {
     isComplaint,
+    isForwardOrReply,
+    hasCaseIdSignal,
     externalCaseId:
       match(
         combined,
@@ -531,6 +563,13 @@ export interface IngestEmailMessageOptions {
   notificationService?: NotificationService
   /** Skips the settings-table notification config load when a service is injected. */
   skipNotificationConfigLoad?: boolean
+  /**
+   * Owner-selected import (preview flow) only. When true and the deterministic
+   * gate says NOT a complaint, route to REVIEW_REQUIRED instead of IGNORED, so
+   * a genuine forward/reply the gate missed is preserved for human review.
+   * Automatic discovery must NOT set this: it keeps IGNORED for non-candidates.
+   */
+  allowOwnerSelectedReview?: boolean
 }
 
 export async function ingestEmailMessage(
@@ -661,6 +700,42 @@ export async function ingestEmailMessage(
     // Stage 3 — deterministic normalization (no model calls in this stage).
     const extraction = extractComplaint(message)
     if (!extraction.isComplaint) {
+      // Owner-selected import (preview flow) preserves ambiguous mail for
+      // human review instead of silently ignoring it. Automatic discovery
+      // keeps the IGNORED path: non-candidates never become review items
+      // without an explicit owner selection.
+      if (options.allowOwnerSelectedReview) {
+        await db
+          .prepare(
+            `UPDATE gmail_messages SET processing_status='REVIEW_REQUIRED',processing_detail='OWNER_SELECTED_NON_CANDIDATE',processed_at=?,updated_at=? WHERE gmail_message_id=?`,
+          )
+          .bind(now, now, message.id)
+          .run()
+        await recordIntegrationEvent(
+          db,
+          'MESSAGE_REVIEW_REQUIRED',
+          message.id,
+          'REVIEW_REQUIRED',
+          'OWNER_SELECTED_NON_CANDIDATE',
+        )
+        await commitEvent({
+          eventType: 'REVIEW_REQUIRED',
+          payload: {
+            reason: 'OWNER_SELECTED_NON_CANDIDATE',
+            isForwardOrReply: extraction.isForwardOrReply,
+            hasCaseIdSignal: extraction.hasCaseIdSignal,
+            extractionRules: extraction.extractionRules,
+          },
+          occurredAt: message.internalDate,
+          review: {
+            id: crypto.randomUUID(),
+            reasonCode: 'OWNER_SELECTED_NON_CANDIDATE',
+            disagreementFlags: ['FORWARD_REPLY_OR_AMBIGUOUS'],
+          },
+        })
+        await foundation.finishProcessing(lease, 'REVIEW_REQUIRED', now)
+        return { status: 'REVIEW_REQUIRED' }
+      }
       await db
         .prepare(
           `UPDATE gmail_messages SET processing_status='IGNORED',processing_detail='NOT_COMPLAINT',processed_at=?,updated_at=? WHERE gmail_message_id=?`,

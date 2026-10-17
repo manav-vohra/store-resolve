@@ -25,6 +25,7 @@ import { authenticate, canAdmin, canViewComplaint, maskEmail, maskPhone } from '
 import { REVIEW_QUEUE_DETAIL_QUERY, REVIEW_QUEUE_LIST_QUERY } from './review-queue'
 import { loadState, persistState, type D1Database } from './d1'
 import { SignalWireSmsProvider, WebPushProvider } from './providers'
+import { buildTestPushPayload } from './webpush'
 import { applySignalWireCallback, reconcileSignalWireMessage } from './callbacks'
 import {
   maskGraphIdentifier,
@@ -36,6 +37,12 @@ import { buildPilotBodyDiagnosticReport } from './pilot-body-diagnostic'
 import { EmailProviderError } from './email-provider'
 import { ingestApprovedPilotCasePair, ingestSinglePilotComplaint } from './ingestion'
 import { GraphDeltaDiscoveryClient, runMailboxDiscovery } from './mail-discovery'
+import {
+  DEFAULT_PREVIEW_WINDOW,
+  importSelectedPreviewMessages,
+  runMailPreview,
+  validatePreviewWindow,
+} from './mail-preview'
 import {
   ResponseWorkflowError,
   approveResponseAction,
@@ -336,6 +343,94 @@ app.get('/api/admin/email/readiness', async (c) => {
   } catch (error) {
     const code = error instanceof EmailProviderError ? error.code : 'MS_GRAPH_READINESS_FAILED'
     return c.json({ ok: false, ready: false, error: code }, 503)
+  }
+})
+
+// Phase 1 — Check Mail Now preview. Read-only: no complaints, no cursor, no sends, no D1 writes.
+// Owner-only. Accepts ?start= &end= ISO, ?top= (1..100), ?nextLink= (opaque Graph paging cursor).
+app.get('/api/admin/email/preview', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const state = await loadState(c.env.DB)
+  if (state.config.mode !== 'FAMILY_PILOT')
+    return c.json(jsonError('Preview is only available in FAMILY_PILOT'), 409)
+  const graph = emailProvider(c.env)
+  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  const start = c.req.query('start') || DEFAULT_PREVIEW_WINDOW.receivedStart
+  const end = c.req.query('end') || DEFAULT_PREVIEW_WINDOW.receivedEnd
+  const windowCheck = validatePreviewWindow(start, end)
+  if (!windowCheck.ok) return c.json(jsonError(windowCheck.error), 400)
+  const top = Math.max(1, Math.min(100, Number(c.req.query('top') ?? 50) || 50))
+  try {
+    const result = await runMailPreview(
+      c.env.DB,
+      graph,
+      { receivedStart: start, receivedEnd: end },
+      top,
+      c.req.query('nextLink') || undefined,
+    )
+    return c.json({
+      ok: true,
+      window: { receivedStart: start, receivedEnd: end },
+      count: result.items.length,
+      items: result.items,
+      nextLink: result.nextLink ?? null,
+    })
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_FAILED'
+    return c.json(jsonError(code), 503)
+  }
+})
+
+// Phase 1 — Selective import from a preview window. Owner-only. Requires
+// FAMILY_PILOT, external OFF, ack OFF. Ingestion flag is NOT required: this is
+// explicit selection, not broad discovery. Each id is re-validated against a
+// fresh preview listing for the same window. Per-message failures are returned,
+// never swallowed. No delta cursor is touched.
+app.post('/api/admin/email/preview-import', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const state = await loadState(c.env.DB)
+  if (
+    state.config.mode !== 'FAMILY_PILOT' ||
+    state.config.externalNotificationsEnabled ||
+    state.config.emailAckEnabled
+  )
+    return c.json(jsonError('Production safety controls must remain locked down'), 409)
+  const graph = emailProvider(c.env)
+  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json(jsonError('Invalid JSON'), 400)
+  }
+  const parsed = z
+    .object({
+      messageIds: z.array(z.string().min(1)).min(1).max(50),
+      receivedStart: z.string().optional(),
+      receivedEnd: z.string().optional(),
+      ingestionMode: z.enum(['LIVE', 'BACKFILL']).optional(),
+    })
+    .safeParse(body)
+  if (!parsed.success) return c.json(jsonError('Invalid preview-import request'), 400)
+  const start = parsed.data.receivedStart || DEFAULT_PREVIEW_WINDOW.receivedStart
+  const end = parsed.data.receivedEnd || DEFAULT_PREVIEW_WINDOW.receivedEnd
+  const windowCheck = validatePreviewWindow(start, end)
+  if (!windowCheck.ok) return c.json(jsonError(windowCheck.error), 400)
+  try {
+    const result = await importSelectedPreviewMessages(
+      c.env.DB,
+      graph,
+      { receivedStart: start, receivedEnd: end },
+      parsed.data.messageIds,
+      parsed.data.ingestionMode ?? 'BACKFILL',
+    )
+    await auditAdminChange(c.env.DB, 'PREVIEW_IMPORT', 'email-preview-import', user.id)
+    return c.json({ ok: true, ...result })
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_IMPORT_FAILED'
+    return c.json(jsonError(code), 503)
   }
 })
 
@@ -813,9 +908,13 @@ app.post('/api/admin/push/test', zValidator('json', testNotificationSchema), asy
   const id = `pushtest-${crypto.randomUUID()}`
   let status = 'SUPPRESSED',
     reason: string | undefined
-  if (!webPush(c.env).ready) reason = 'WEBPUSH_NOT_READY'
-  else if (!subscription) reason = 'NO_PUSH_SUBSCRIPTION'
-  else {
+  if (!webPush(c.env).ready) {
+    status = 'FAILED'
+    reason = 'WEBPUSH_NOT_READY'
+  } else if (!subscription) {
+    status = 'FAILED'
+    reason = 'NO_PUSH_SUBSCRIPTION'
+  } else {
     const outstanding = state.complaints.filter(
       (complaint) =>
         complaint.assignedManagerId === recipient.id &&
@@ -828,13 +927,7 @@ app.post('/api/admin/push/test', zValidator('json', testNotificationSchema), asy
           p256dhKey: subscription.p256dh_key,
           authKey: subscription.auth_key,
         },
-        {
-          title: 'StoreResolve test',
-          body: 'TEST — push notifications are connected to this device. No action needed.',
-          url: '/',
-          tag: 'storeresolve-test-push',
-          badgeCount: outstanding,
-        },
+        buildTestPushPayload(outstanding),
       )
       if (result.expired) {
         status = 'FAILED'
@@ -1222,11 +1315,26 @@ app.post('/api/admin/email/discover', async (c) => {
     return c.json({ ok: false, ran: false, reason: 'INGESTION_DISABLED' })
   const graph = emailProvider(c.env)
   if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  // Optional date window (bounds historical mail on initial delta). When
+  // omitted, discovery uses the stored cursor (incremental only).
+  let receivedStart: string | undefined
+  let receivedEnd: string | undefined
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>
+    if (typeof body.receivedStart === 'string') receivedStart = body.receivedStart
+    if (typeof body.receivedEnd === 'string') receivedEnd = body.receivedEnd
+  } catch {
+    // Empty body is fine.
+  }
+  if ((receivedStart || receivedEnd) && !validatePreviewWindow(receivedStart ?? '1970-01-01T00:00:00.000Z', receivedEnd ?? '2100-01-01T00:00:00.000Z').ok)
+    return c.json(jsonError('INVALID_WINDOW'), 400)
   const result = await runMailboxDiscovery(c.env.DB, {
     provider: 'MICROSOFT_GRAPH',
     mailboxKey: 'production',
     ingestionEnabled: true,
     client: new GraphDeltaDiscoveryClient(graph),
+    receivedStart,
+    receivedEnd,
   })
   return c.json({ ok: result.ran, ...result })
 })

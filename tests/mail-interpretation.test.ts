@@ -345,12 +345,26 @@ describe('interpretWithConfig', () => {
     expect(calls).toBe(0)
   })
 
-  it('converts transport failures into abstained results instead of throwing', async () => {
-    const interpreter = new OpenAiMailInterpreter(enabledConfig, new DisabledModelTransport())
+  it('converts live transport failures into abstained results instead of throwing', async () => {
+    const failingTransport = {
+      async complete() {
+        throw new MailInterpretationError('MODEL_TRANSPORT_FAILED', 'live transport failed')
+      },
+    }
+    const interpreter = new OpenAiMailInterpreter(enabledConfig, failingTransport)
     const result = await interpretWithConfig(interpreter, testInput(), enabledConfig)
     expect(result.skipped).toBe(false)
     expect(result.output).toBeNull()
     expect(result.disagreements.map((d) => d.code)).toContain('ABSTAINED')
+  })
+
+  it('treats a disabled transport as skipped, not ABSTAINED', async () => {
+    const interpreter = new OpenAiMailInterpreter(enabledConfig, new DisabledModelTransport())
+    const result = await interpretWithConfig(interpreter, testInput(), enabledConfig)
+    expect(result.skipped).toBe(true)
+    expect(result.output).toBeNull()
+    expect(result.disagreements).toEqual([])
+    expect(result.validation.errors).toContain('interpreter disabled - no live transport')
   })
 
   it('refuses non-complaint candidates without invoking the interpreter', async () => {
@@ -540,16 +554,18 @@ describe('Phase B intake wiring', () => {
     expect(JSON.parse(run?.disagreement_flags_json ?? '[]')).toContain('CASE_ID_MISMATCH')
   })
 
-  it('records ABSTAINED and still completes intake when the transport is disabled but the flag is on', async () => {
+  it('skips interpretation (no record) and still completes intake when the transport is disabled but the flag is on', async () => {
     const result = await ingestEmailMessage(db, message(), {
       interpretationConfig: enabledConfig,
       // default interpreter -> OpenAiMailInterpreter + DisabledModelTransport: must never throw
     })
     expect(result.status).toBe('PROCESSED')
     const run = await runRow('graph-1')
-    expect(run?.model_name).toBe('gpt-4o-mini')
+    // Disabled transport = skipped: no interpretation record is written, so
+    // model_name stays null and no ABSTAINED disagreement is recorded.
+    expect(run?.model_name).toBeNull()
     expect(run?.ai_structured_output_json).toBeNull()
-    expect(JSON.parse(run?.disagreement_flags_json ?? '[]')).toContain('ABSTAINED')
+    expect(JSON.parse(run?.disagreement_flags_json ?? '[]')).not.toContain('ABSTAINED')
   })
 
   it('never invokes the interpreter for non-complaint mail, even when enabled', async () => {

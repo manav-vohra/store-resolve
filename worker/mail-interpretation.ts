@@ -444,6 +444,22 @@ export async function processRawInterpretation(
     latencyMs: raw.latencyMs,
     skipped: false,
   }
+  // Phase 1 fix: a disabled transport is NOT a model abstention. It means no
+  // live model exists, so the pipeline must proceed deterministically and
+  // the caller must treat this as skipped (no interpretation record), not as
+  // a model signal. ABSTAINED is reserved for a live transport that ran but
+  // returned no usable output.
+  if (raw.errorCode === 'MODEL_TRANSPORT_DISABLED')
+    return {
+      ...base,
+      output: null,
+      rawText: null,
+      outputSha256: null,
+      confidence: null,
+      disagreements: [],
+      validation: { valid: false, errors: ['interpreter disabled - no live transport'] },
+      skipped: true,
+    }
   if (raw.errorCode || raw.rawText === null)
     return {
       ...base,

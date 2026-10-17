@@ -547,8 +547,19 @@ export class MicrosoftGraphProvider implements EmailProvider {
    * deltaLink (or nextLink) to continue; the final page returns a fresh
    * deltaLink to persist as the cursor. No live calls happen unless the
    * caller invokes this — tests use a fake DeltaDiscoveryClient instead.
+   *
+   * Phase 1 fix: initial delta requests are metadata-only (no body,
+   * bodyPreview, or headers) and accept an optional receivedDateTime window.
+   * The window is sent as Graph $filter AND enforced client-side by the
+   * caller, because Graph may ignore $filter on delta. Full bodies are
+   * fetched per-message only when that message needs processing, via
+   * getMessage(). This prevents the initial delta from pulling bodies for
+   * the whole historical inbox.
    */
-  async listInboxDeltaPage(link?: string): Promise<InboxDeltaPage> {
+  async listInboxDeltaPage(
+    link?: string,
+    options?: { receivedStart?: string; receivedEnd?: string },
+  ): Promise<InboxDeltaPage> {
     const select = [
       'id',
       'conversationId',
@@ -559,13 +570,22 @@ export class MicrosoftGraphProvider implements EmailProvider {
       'sender',
       'toRecipients',
       'ccRecipients',
-      'body',
-      'bodyPreview',
-      'internetMessageHeaders',
+      'parentFolderId',
     ].join(',')
-    const path =
-      link ??
-      `/me/mailFolders/inbox/messages/delta?$select=${encodeURIComponent(select)}&$top=25`
+    let path: string
+    if (link) {
+      path = link
+    } else {
+      const params = new URLSearchParams({
+        $select: select,
+        $top: '25',
+      })
+      const filters: string[] = []
+      if (options?.receivedStart) filters.push(`receivedDateTime ge ${options.receivedStart}`)
+      if (options?.receivedEnd) filters.push(`receivedDateTime lt ${options.receivedEnd}`)
+      if (filters.length > 0) params.set('$filter', filters.join(' and '))
+      path = `/me/mailFolders/inbox/messages/delta?${params.toString()}`
+    }
     const page = await this.request<{
       value?: GraphMessage[]
       '@odata.nextLink'?: string
@@ -576,6 +596,51 @@ export class MicrosoftGraphProvider implements EmailProvider {
       nextLink: page['@odata.nextLink'],
       deltaLink: page['@odata.deltaLink'],
     }
+  }
+
+  /**
+   * Preview-only inbox listing for the Check Mail Now flow. Uses
+   * /me/messages (NOT delta), so it never advances the ingestion cursor.
+   * Returns metadata + bodyPreview (for classification) but never full
+   * bodies or headers. Read-only: no D1 writes, no sends, no cursor change.
+   */
+  async listInboxPreviewPage(options: {
+    receivedStart: string
+    receivedEnd: string
+    top?: number
+    nextLink?: string
+  }): Promise<{ messages: GraphMessage[]; nextLink?: string }> {
+    if (options.nextLink) {
+      const page = await this.request<{
+        value?: GraphMessage[]
+        '@odata.nextLink'?: string
+      }>(options.nextLink)
+      return { messages: page.value ?? [], nextLink: page['@odata.nextLink'] }
+    }
+    const select = [
+      'id',
+      'conversationId',
+      'internetMessageId',
+      'receivedDateTime',
+      'subject',
+      'from',
+      'sender',
+      'toRecipients',
+      'ccRecipients',
+      'parentFolderId',
+      'bodyPreview',
+    ].join(',')
+    const params = new URLSearchParams({
+      $select: select,
+      $filter: `receivedDateTime ge ${options.receivedStart} and receivedDateTime lt ${options.receivedEnd}`,
+      $orderby: 'receivedDateTime desc',
+      $top: String(Math.max(1, Math.min(100, options.top ?? 50))),
+    })
+    const page = await this.request<{
+      value?: GraphMessage[]
+      '@odata.nextLink'?: string
+    }>(`/me/messages?${params.toString()}`)
+    return { messages: page.value ?? [], nextLink: page['@odata.nextLink'] }
   }
 
   async listMessageIds(lookbackDays: number, maxResults = 25): Promise<string[]> {    const since = new Date(

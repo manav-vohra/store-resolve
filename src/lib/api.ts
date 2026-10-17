@@ -143,6 +143,68 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  previewMail: (params: { start: string; end: string; top?: number; nextLink?: string }) => {
+    const query = new URLSearchParams({ start: params.start, end: params.end, top: String(params.top ?? 50) })
+    if (params.nextLink) query.set('nextLink', params.nextLink)
+    return request(
+      `/admin/email/preview?${query.toString()}`,
+      z.object({
+        ok: z.literal(true),
+        window: z.object({ receivedStart: z.string(), receivedEnd: z.string() }),
+        count: z.number(),
+        items: z.array(
+          z.object({
+            graphMessageId: z.string(),
+            maskedId: z.string(),
+            conversationId: z.string(),
+            maskedConversationId: z.string(),
+            receivedAt: z.string(),
+            sender: z.string(),
+            senderDisplay: z.string(),
+            subject: z.string(),
+            detectedCaseId: z.string().nullable(),
+            detectedStoreNumber: z.string().nullable(),
+            isForwardOrReply: z.boolean(),
+            classification: z.enum([
+              'COMPLAINT_CANDIDATE',
+              'FOLLOW_UP_LIKELY',
+              'NEEDS_REVIEW',
+              'NOT_COMPLAINT',
+              'ALREADY_INGESTED',
+            ]),
+            alreadyIngested: z.boolean(),
+            classificationReason: z.string(),
+            linkedComplaintId: z.string().nullable(),
+          }),
+        ),
+        nextLink: z.string().nullable(),
+      }),
+    )
+  },
+  importPreviewMail: (body: {
+    messageIds: string[]
+    receivedStart: string
+    receivedEnd: string
+    ingestionMode?: 'LIVE' | 'BACKFILL'
+  }) =>
+    request(
+      '/admin/email/preview-import',
+      z.object({
+        ok: z.literal(true),
+        results: z.array(
+          z.object({
+            graphMessageId: z.string(),
+            maskedId: z.string(),
+            status: z.string(),
+            complaintId: z.string().optional(),
+            errorCode: z.string().optional(),
+          }),
+        ),
+        imported: z.number(),
+        failed: z.number(),
+      }),
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
   updateStore: (id: string, store: Store) =>
     request(`/admin/stores/${encodeURIComponent(id)}`, stateSchema, {
       method: 'PUT',

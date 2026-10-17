@@ -29,6 +29,7 @@ import {
   type PushStatus,
 } from './lib/push'
 import ReviewQueue from './ReviewQueue'
+import { CheckMailNow } from './components/CheckMailNow'
 import { fixtures, initialState } from './lib/seed'
 import type { AppState, Complaint, IntegrationHealth, NewComplaint, Severity } from './lib/types'
 
@@ -1780,6 +1781,7 @@ function PilotControls({
             five-minute window. At most two metadata rows prove uniqueness before one body read.
           </small>
         </section>
+        <CheckMailNow />
         <section className="panel settings-card">
           <h2>SLA and background processing</h2>
           <label>

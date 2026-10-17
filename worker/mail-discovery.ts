@@ -28,14 +28,20 @@ import {
 
 /** Minimal delta-page client so tests never touch the network. */
 export interface DeltaDiscoveryClient {
-  fetchDeltaPage(link?: string): Promise<InboxDeltaPage>
+  fetchDeltaPage(
+    link?: string,
+    options?: { receivedStart?: string; receivedEnd?: string },
+  ): Promise<InboxDeltaPage>
 }
 
 /** Live client: thin wrapper over the real Graph provider. */
 export class GraphDeltaDiscoveryClient implements DeltaDiscoveryClient {
   constructor(private readonly provider: MicrosoftGraphProvider) {}
-  fetchDeltaPage(link?: string): Promise<InboxDeltaPage> {
-    return this.provider.listInboxDeltaPage(link)
+  fetchDeltaPage(
+    link?: string,
+    options?: { receivedStart?: string; receivedEnd?: string },
+  ): Promise<InboxDeltaPage> {
+    return this.provider.listInboxDeltaPage(link, options)
   }
 }
 
@@ -62,6 +68,9 @@ export interface MailboxDiscoveryOptions {
   ingestionEnabled: boolean
   client: DeltaDiscoveryClient
   maxPages?: number
+  /** Optional receivedDateTime window for the initial delta (bounds historical mail). */
+  receivedStart?: string
+  receivedEnd?: string
   /** Defaults to the real intake path. Tests inject a spy. */
   ingest?: (
     db: D1Database,
@@ -71,11 +80,13 @@ export interface MailboxDiscoveryOptions {
 
 export interface MailboxDiscoveryResult {
   ran: boolean
-  reason?: 'INGESTION_DISABLED' | 'DISCOVERY_FAILED'
+  reason?: 'INGESTION_DISABLED' | 'DISCOVERY_FAILED' | 'DISCOVERY_PARTIAL_FAILURES'
   discovered: number
   ingested: number
   skipped: number
   failures: number
+  /** Graph message ids that failed this run. Never silently dropped: the cursor does NOT advance past them. */
+  failedIds: string[]
   cursorUpdated: boolean
   errorCode?: string
 }
@@ -167,6 +178,7 @@ export async function runMailboxDiscovery(
     ingested: 0,
     skipped: 0,
     failures: 0,
+    failedIds: [],
     cursorUpdated: false,
   }
   if (!options.ingestionEnabled) return { ...empty, reason: 'INGESTION_DISABLED' }
@@ -184,15 +196,62 @@ export async function runMailboxDiscovery(
     ingested: 0,
     skipped: 0,
     failures: 0,
+    failedIds: [],
     cursorUpdated: false,
   }
-  let link: string | undefined = (await readCursor(db, provider, mailboxKey, scope)) ?? undefined
+  const initialCursor = (await readCursor(db, provider, mailboxKey, scope)) ?? undefined
+  let link: string | undefined = initialCursor
   let highWater: string | null = null
   const maxPages = options.maxPages ?? MAX_PAGES_DEFAULT
+  const windowStart = options.receivedStart ? Date.parse(options.receivedStart) : NaN
+  const windowEnd = options.receivedEnd ? Date.parse(options.receivedEnd) : NaN
+  const inWindow = (receivedAt: string) => {
+    const t = Date.parse(receivedAt)
+    if (!Number.isFinite(t)) return false
+    if (Number.isFinite(windowStart) && t < windowStart) return false
+    if (Number.isFinite(windowEnd) && t >= windowEnd) return false
+    return true
+  }
 
   try {
     for (let page = 0; page < maxPages; page += 1) {
-      const delta = await options.client.fetchDeltaPage(link)
+      let delta: InboxDeltaPage
+      try {
+        // Only the initial call (no link) carries the date window. Continuation
+        // links already encode Graph's paging state; passing a filter with
+        // them would be invalid.
+        delta = await options.client.fetchDeltaPage(
+          link,
+          link ? undefined : { receivedStart: options.receivedStart, receivedEnd: options.receivedEnd },
+        )
+      } catch (fetchError) {
+        // Cursor expired / invalid (Graph 410 or invalid delta token): reset to
+        // a fresh sync once, with the date window, instead of silently skipping.
+        const isCursorError =
+          fetchError instanceof EmailProviderError &&
+          (fetchError.code.includes('410') ||
+            fetchError.code.includes('INVALID') ||
+            fetchError.message.includes('410') ||
+            fetchError.message.toLowerCase().includes('delta'))
+        if (isCursorError && link && link !== initialCursor) {
+          // link was a continuation we already persisted; fall through to the
+          // outer catch which leaves the previous cursor intact.
+          throw fetchError
+        }
+        if (isCursorError && link) {
+          await writeCursor(db, provider, mailboxKey, scope, {
+            cursorValue: null,
+            lastErrorCode: 'DELTA_CURSOR_EXPIRED',
+          })
+          link = undefined
+          delta = await options.client.fetchDeltaPage(undefined, {
+            receivedStart: options.receivedStart,
+            receivedEnd: options.receivedEnd,
+          })
+        } else {
+          throw fetchError
+        }
+      }
       for (const graphMessage of delta.messages) {
         if (isRemoved(graphMessage)) {
           result.skipped += 1
@@ -203,6 +262,13 @@ export async function runMailboxDiscovery(
           normalized = normalizeGraphMessage(graphMessage)
         } catch {
           result.failures += 1
+          if (graphMessage.id) result.failedIds.push(graphMessage.id)
+          continue
+        }
+        // Enforce the date window client-side even if Graph ignored $filter.
+        // Out-of-window mail is skipped, not ingested, not a failure.
+        if (!inWindow(normalized.internalDate)) {
+          result.skipped += 1
           continue
         }
         if (!highWater || normalized.internalDate > highWater) highWater = normalized.internalDate
@@ -221,9 +287,25 @@ export async function runMailboxDiscovery(
         } catch {
           result.discovered += 1
           result.failures += 1
+          result.failedIds.push(normalized.id)
         }
       }
       if (delta.deltaLink) {
+        // Durable cursor rule: NEVER advance past failures. If any message in
+        // this run failed, keep the previous cursor so the next run re-processes
+        // from before the failed batch (successes dedupe via DUPLICATE). Failed
+        // ids are returned explicitly; nothing is silently skipped.
+        if (result.failures > 0) {
+          await writeCursor(db, provider, mailboxKey, scope, {
+            lastErrorCode: 'DISCOVERY_PARTIAL_FAILURES',
+          })
+          return {
+            ...result,
+            reason: 'DISCOVERY_PARTIAL_FAILURES',
+            errorCode: 'DISCOVERY_PARTIAL_FAILURES',
+            cursorUpdated: false,
+          }
+        }
         link = delta.deltaLink
         await writeCursor(db, provider, mailboxKey, scope, {
           cursorValue: delta.deltaLink,
@@ -237,9 +319,24 @@ export async function runMailboxDiscovery(
       if (!delta.nextLink) break
       link = delta.nextLink
     }
-    // Ran out of pages without a deltaLink: keep the last nextLink so the next
-    // run resumes paging instead of restarting the sync.
-    if (link) await writeCursor(db, provider, mailboxKey, scope, { cursorValue: link })
+    // Ran out of pages without a deltaLink: only persist the nextLink when
+    // there were no failures, so a failed batch is re-processed from the
+    // previous cursor instead of being skipped.
+    if (result.failures > 0) {
+      await writeCursor(db, provider, mailboxKey, scope, {
+        lastErrorCode: 'DISCOVERY_PARTIAL_FAILURES',
+      })
+      return {
+        ...result,
+        reason: 'DISCOVERY_PARTIAL_FAILURES',
+        errorCode: 'DISCOVERY_PARTIAL_FAILURES',
+        cursorUpdated: false,
+      }
+    }
+    if (link && link !== initialCursor) {
+      await writeCursor(db, provider, mailboxKey, scope, { cursorValue: link })
+      result.cursorUpdated = true
+    }
     return result
   } catch (error) {
     const code = error instanceof EmailProviderError ? error.code : 'DISCOVERY_FAILED'

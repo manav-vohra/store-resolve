@@ -189,7 +189,7 @@ describe('runMailboxDiscovery', () => {
     expect(ingested).toHaveLength(1)
   })
 
-  it('counts ingest failures without aborting the run', async () => {
+  it('counts ingest failures without aborting the run and does NOT advance the cursor past them', async () => {
     const db = new FakeDb()
     const { options } = baseOptions(db, [{ messages: [graphMessage('m1'), graphMessage('m2')], deltaLink: 'd' }], {
       ingest: async (_d, message) => {
@@ -201,6 +201,33 @@ describe('runMailboxDiscovery', () => {
     expect(result.discovered).toBe(2)
     expect(result.ingested).toBe(1)
     expect(result.failures).toBe(1)
+    expect(result.failedIds).toEqual(['m1'])
+    expect(result.reason).toBe('DISCOVERY_PARTIAL_FAILURES')
+    // Durable cursor rule: never advance past failures; next run re-processes
+    // from the previous cursor (successes dedupe via DUPLICATE).
+    expect(result.cursorUpdated).toBe(false)
+    const cursor = db.cursors.get('MICROSOFT_GRAPH:production:inbox-delta')
+    expect(cursor?.cursor_value).not.toBe('d')
+  })
+
+  it('enforces the date window client-side even if Graph ignores $filter', async () => {
+    const db = new FakeDb()
+    const old = graphMessage('old')
+    old.receivedDateTime = '2026-09-01T10:00:00.000Z'
+    const inWindow = graphMessage('new')
+    inWindow.receivedDateTime = '2026-10-12T10:00:00.000Z'
+    const { options, ingested } = baseOptions(
+      db,
+      [{ messages: [old, inWindow], deltaLink: 'd2' }],
+      {
+        receivedStart: '2026-10-10T00:00:00.000Z',
+        receivedEnd: '2026-10-17T23:59:59.999Z',
+      },
+    )
+    const result = await runMailboxDiscovery(db, options)
+    expect(result.discovered).toBe(1)
+    expect(result.skipped).toBe(1)
+    expect(ingested.map((m) => m.id)).toEqual(['new'])
     expect(result.cursorUpdated).toBe(true)
   })
 
