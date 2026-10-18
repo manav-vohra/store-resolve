@@ -91,10 +91,17 @@ export default function App() {
   const [view, setView] = useState<View>('dashboard')
   const [selectedId, setSelectedId] = useState<string>()
   const [toast, setToast] = useState<string>()
+  const [quotaExceeded, setQuotaExceeded] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const user = state.users.find((u) => u.id === state.activeUserId)!
   const selected = state.complaints.find((c) => c.id === selectedId)
   const show = (message: string) => {
+    // D1 quota failures get a persistent banner, not a 2.8s toast —
+    // the whole app is down until the quota resets or the plan upgrades.
+    if (message === 'D1_QUOTA_EXCEEDED') {
+      setQuotaExceeded(true)
+      return
+    }
     setToast(message)
     window.setTimeout(() => setToast(undefined), 2800)
   }
@@ -116,6 +123,7 @@ export default function App() {
         setState(result.state)
         setProviderReady(result.providerReady)
         setHealth(result.health)
+        setQuotaExceeded(false)
       })
       .catch((error: Error) => show(error.message))
       .finally(() => setLoading(false))
@@ -130,8 +138,11 @@ export default function App() {
             setState(result.state)
             setProviderReady(result.providerReady)
             setHealth(result.health)
+            setQuotaExceeded(false)
           })
-          .catch(() => undefined),
+          .catch((error: Error) => {
+            if (error.message === 'D1_QUOTA_EXCEEDED') setQuotaExceeded(true)
+          }),
       10_000,
     )
     return () => window.clearInterval(timer)
@@ -447,6 +458,17 @@ export default function App() {
           )}
         </div>
       </main>
+      {quotaExceeded && (
+        <div
+          className="toast"
+          style={{ background: '#7c2d12', color: '#fff', maxWidth: '92vw' }}
+          role="alert"
+        >
+          Database daily limit reached — the app can&apos;t load data until it
+          resets at midnight UTC (8pm ET) or the plan is upgraded. Nothing is
+          lost; try again later.
+        </div>
+      )}
       {toast && (
         <div className="toast">
           <Check />

@@ -169,17 +169,44 @@ app.post('/api/signalwire/status', async (c) => {
   return c.json({ ok: true, result })
 })
 
-// DIAGNOSTIC (Oct 18): global error handler to surface the real error
-// behind the blank 500s on all /api/* routes. Remove once fixed.
-app.onError((err, c) => {
+// Quota + error classification (Oct 18): D1's free-tier daily row-read
+// limit kills EVERY api route with a generic throw. Classify it here so
+// clients (and our own watchdog) get a structured, actionable error
+// instead of a blank 500. This is the fast-detection system: any D1
+// quota failure is flagged immediately with its reset time, no
+// dedicated diagnostics needed.
+const classifyWorkerError = (err: unknown): { code: string; status: number; detail: string } => {
   const detail = err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 500) : 'UNKNOWN'
-  return c.json({ ...jsonError('WORKER_ERROR'), detail }, 500)
+  const msg = detail.toLowerCase()
+  if (msg.includes('d1') && (msg.includes('row read limit') || msg.includes('exceeded') || msg.includes('quota') || msg.includes('limit'))) {
+    return {
+      code: 'D1_QUOTA_EXCEEDED',
+      status: 503,
+      detail: `${detail} | D1 daily row-read quota exceeded. Resets at midnight UTC. Reduce D1 reads or upgrade the Workers plan.`,
+    }
+  }
+  return { code: 'WORKER_ERROR', status: 500, detail }
+}
+app.onError((err, c) => {
+  const { code, status, detail } = classifyWorkerError(err)
+  return c.json({ ...jsonError(code), detail }, status as 500 | 503)
 })
 app.use('/api/*', async (c, next) => {
   const user = await authenticate(c.req.raw, c.env.DB, c.env)
   if (!user) return c.json(jsonError('Unauthorized'), 401)
   c.set('user', user)
   await next()
+})
+// Ultra-cheap D1 canary for the external watchdog (1 row, no app state).
+// Registered AFTER the auth middleware so c.get('user') is populated.
+// The watchdog hits this instead of bootstrap: if it returns
+// D1_QUOTA_EXCEEDED, the quota is blown and the user is alerted.
+// Costs ~nothing when healthy.
+app.get('/api/d1-ping', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const row = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>()
+  return c.json({ ok: row?.ok === 1, ts: new Date().toISOString() })
 })
 app.get('/api/bootstrap', async (c) => {
   const state = await loadState(c.env.DB)
