@@ -169,6 +169,12 @@ app.post('/api/signalwire/status', async (c) => {
   return c.json({ ok: true, result })
 })
 
+// DIAGNOSTIC (Oct 18): global error handler to surface the real error
+// behind the blank 500s on all /api/* routes. Remove once fixed.
+app.onError((err, c) => {
+  const detail = err instanceof Error ? `${err.name}: ${err.message}`.slice(0, 500) : 'UNKNOWN'
+  return c.json({ ...jsonError('WORKER_ERROR'), detail }, 500)
+})
 app.use('/api/*', async (c, next) => {
   const user = await authenticate(c.req.raw, c.env.DB, c.env)
   if (!user) return c.json(jsonError('Unauthorized'), 401)
