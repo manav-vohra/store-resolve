@@ -130,21 +130,35 @@ export default function App() {
   }, [])
   useEffect(() => {
     if (loading) return
-    const timer = window.setInterval(
-      () =>
-        api
-          .bootstrap()
-          .then((result) => {
-            setState(result.state)
-            setProviderReady(result.providerReady)
-            setHealth(result.health)
+    // Lightweight poll: check the state version (1 row read) every 10s and
+    // only do a full bootstrap when something actually changed. This replaces
+    // the old behavior of reloading seven tables plus Graph/SignalWire
+    // connection checks on every poll.
+    let lastVersion = -1
+    const checkVersion = () =>
+      api
+        .stateVersion()
+        .then((result) => {
+          if (lastVersion !== -1 && result.version === lastVersion) return
+          lastVersion = result.version
+          return api.bootstrap().then((full) => {
+            setState(full.state)
+            setProviderReady(full.providerReady)
+            setHealth(full.health)
             setQuotaExceeded(false)
           })
-          .catch((error: Error) => {
-            if (error.message === 'D1_QUOTA_EXCEEDED') setQuotaExceeded(true)
-          }),
-      10_000,
-    )
+        })
+        .catch((error: Error) => {
+          if (error.message === 'D1_QUOTA_EXCEEDED') setQuotaExceeded(true)
+        })
+    // Prime the version on mount so the first poll doesn't double-bootstrap.
+    api
+      .stateVersion()
+      .then((result) => {
+        lastVersion = result.version
+      })
+      .catch(() => {})
+    const timer = window.setInterval(checkVersion, 10_000)
     return () => window.clearInterval(timer)
   }, [loading])
   // Deep-link handling: open `#/complaints/:id` on cold start (e.g. a push

@@ -859,7 +859,12 @@ export async function ingestEmailMessage(
           severity: extraction.severity,
         },
         message.internalDate,
-        { source: 'MICROSOFT_GRAPH', actor: 'microsoft-graph', acknowledged: false },
+        {
+          source: 'MICROSOFT_GRAPH',
+          actor: 'microsoft-graph',
+          acknowledged: false,
+          ingestionMode,
+        },
       )
       Object.assign(result.complaint, {
         source: 'MICROSOFT_GRAPH',

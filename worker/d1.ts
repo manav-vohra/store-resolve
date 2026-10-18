@@ -66,7 +66,7 @@ export async function loadState(db: D1Database): Promise<AppState> {
     postalCode: String(r.postal_code),
     phone: String(r.phone),
     active: bool(r.active),
-    managerId: String(r.manager_id),
+    managerId: r.manager_id ? String(r.manager_id) : undefined,
     aliases: aliasesByStore.get(String(r.id)) ?? [],
   }))
   const eventMap = new Map<string, Complaint['events']>()
@@ -352,6 +352,15 @@ export async function persistState(db: D1Database, state: AppState): Promise<voi
         `INSERT INTO settings(key,value,updated_at) VALUES('email_lookback_days',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
       )
       .bind(String(state.config.emailLookbackDays ?? 30), now),
+  )
+  // Bump the state version so lightweight clients can poll for changes
+  // without reloading all seven tables every 10 seconds.
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO settings(key,value,updated_at) VALUES('state_version', COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key='state_version'), 0) + 1, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
+      )
+      .bind(now),
   )
   for (let i = 0; i < statements.length; i += 50) await db.batch(statements.slice(i, i + 50))
 }

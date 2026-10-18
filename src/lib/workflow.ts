@@ -269,11 +269,19 @@ export function updateComplaint(
   if (!actor) throw new Error('User not found')
   const isOwner = actor.role === 'OWNER' || actor.role === 'ADMIN'
   const isManager = actor.id === c.assignedManagerId
+  // Dad-only pilot: when a complaint has no assigned manager (all prod stores
+  // have manager_id NULL), an OWNER/ADMIN may perform the manager workflow
+  // (acknowledge, investigate, contact, resolve) in FAMILY_PILOT. This does
+  // not grant manager powers over complaints assigned to someone else, and
+  // every action is still recorded in the audit event history.
+  const canActAsManager =
+    isManager ||
+    (isOwner && !c.assignedManagerId && next.config.mode === 'FAMILY_PILOT')
   if (
     ['ACKNOWLEDGE', 'START_INVESTIGATION', 'CONTACT_CUSTOMER', 'SUBMIT_RESOLUTION'].includes(
       action,
     ) &&
-    !isManager
+    !canActAsManager
   )
     throw new Error('Manager access required')
   if (['CLOSE', 'REOPEN'].includes(action) && !isOwner) throw new Error('Owner access required')

@@ -58,7 +58,7 @@ export interface Store {
   postalCode: string
   phone: string
   active: boolean
-  managerId: string
+  managerId?: string
   aliases?: string[]
 }
 export interface ComplaintEvent {

@@ -79,6 +79,7 @@ export const api = {
       body: JSON.stringify({ assigneeUserId }),
     }),
   bootstrap: () => request('/bootstrap', bootstrapSchema),
+  stateVersion: () => request('/state-version', z.object({ version: z.number })),
   createComplaint: (input: NewComplaint) =>
     request('/complaints', stateSchema, {
       method: 'POST',

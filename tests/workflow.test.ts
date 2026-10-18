@@ -167,6 +167,36 @@ describe('manager workflow and authorization', () => {
       'Manager access required',
     )
   })
+  it('lets OWNER run the manager workflow on unassigned complaints in FAMILY_PILOT', () => {
+    // Dad-only pilot: all prod stores have no assigned manager, so Dad
+    // (OWNER) must be able to acknowledge/investigate/resolve. Scoped to
+    // FAMILY_PILOT + unassigned complaints only.
+    const pilotState = structuredClone(state)
+    pilotState.config.mode = 'FAMILY_PILOT'
+    for (const s of pilotState.stores) s.managerId = undefined as unknown as string
+    const r = createComplaint(pilotState, input, received, { ingestionMode: 'BACKFILL' })
+    expect(r.complaint.assignedManagerId).toBeUndefined()
+    let next = updateComplaint(r.state, r.complaint.id, 'ACKNOWLEDGE', 'father', {}, received)
+    expect(next.complaints[0].status).toBe('ACKNOWLEDGED')
+    next = updateComplaint(next, r.complaint.id, 'START_INVESTIGATION', 'father', {}, received)
+    expect(next.complaints[0].status).toBe('INVESTIGATING')
+  })
+  it('still blocks OWNER from manager actions on complaints assigned to someone else', () => {
+    const pilotState = structuredClone(state)
+    pilotState.config.mode = 'FAMILY_PILOT'
+    const r = createComplaint(pilotState, input, received) // store-1 has manager-1 in seed
+    expect(r.complaint.assignedManagerId).toBe('manager-1')
+    expect(() =>
+      updateComplaint(r.state, r.complaint.id, 'ACKNOWLEDGE', 'father', {}, received),
+    ).toThrow('Manager access required')
+  })
+  it('keeps BACKFILL complaints out of the live SLA clock', () => {
+    const r = createComplaint(state, input, received, { ingestionMode: 'BACKFILL' })
+    expect(r.complaint.ingestionMode).toBe('BACKFILL')
+    expect(r.complaint.operationalStartedAt).toBeUndefined()
+    const after = processDeadlines(r.state, '2026-12-01T00:00:00.000Z')
+    expect(after.complaints[0].isAckOverdue).toBe(false)
+  })
   it('allows an owner to close only a submitted resolution and records time', () => {
     const r = create()
     state = updateComplaint(r.state, r.complaint.id, 'ACKNOWLEDGE', 'manager-1', {}, received)

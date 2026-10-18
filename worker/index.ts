@@ -208,6 +208,16 @@ app.get('/api/d1-ping', async (c) => {
   const row = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>()
   return c.json({ ok: row?.ok === 1, ts: new Date().toISOString() })
 })
+// Lightweight change detector: returns the state version counter (1 row).
+// The frontend polls this every 10s and only calls the full /api/bootstrap
+// when the version changes, instead of reloading seven tables plus Graph
+// and SignalWire checks on every poll.
+app.get('/api/state-version', async (c) => {
+  const row = await c.env.DB.prepare(
+    `SELECT value FROM settings WHERE key='state_version'`,
+  ).first<{ value: string }>()
+  return c.json({ version: row ? parseInt(row.value, 10) : 0 })
+})
 app.get('/api/bootstrap', async (c) => {
   const state = await loadState(c.env.DB)
   const user = c.get('user')
