@@ -52,6 +52,14 @@ export async function notifyDadNewComplaint(
     if (complaint.ingestionMode !== 'LIVE')
       return { sent: false, reason: 'NOT_LIVE_INGESTION' }
 
+    // Gate 0b: dad_push_enabled kill switch, enforced HERE (not just by
+    // callers) so no path — including POST /api/complaints — can bypass it.
+    // Default OFF: deploying code never authorizes real pushes by itself.
+    const pushSwitch = await db
+      .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
+      .first<{ value: string }>()
+    if (pushSwitch?.value !== 'true') return { sent: false, reason: 'PUSH_DISABLED' }
+
     // Gate 1: FAMILY_PILOT only. The settings key is 'notification_mode'
     // (see worker/d1.ts loadState); 'mode' does not exist.
     const mode = await db
@@ -166,13 +174,35 @@ async function record(
  * is recorded as SENT, but that is not proof the iPhone displayed it.
  * The outbox is the source of truth for attempts, not for display.
  */
+/**
+ * Retry failed Dad pushes with durable, idempotent recovery.
+ *
+ * - Finds FAILED push notifications for Dad (COMPLAINT_RECEIVED, channel PUSH).
+ * - Skips non-LIVE complaints (historical mail never gets retried pushes).
+ * - Atomic reservation: UPDATE ... WHERE status='FAILED' and require
+ *   exactly one affected row (via result.meta.changes) before sending.
+ *   Concurrent workers cannot double-send.
+ * - Cumulative retry limit: 3 attempts max per notification, tracked via
+ *   RETRY_n prefix in failure_reason. Exponential backoff: 5min, 30min, 2h.
+ * - Uncertain provider outcomes (timeout/5xx after submit) go to
+ *   NEEDS_RECONCILIATION, never auto-resent — a human verifies before retry.
+ * - Never throws; returns per-notification outcomes.
+ *
+ * Delivery semantics: provider acceptance (2xx) is recorded as SENT, but
+ * that is not proof the iPhone displayed it. The outbox tracks attempts;
+ * display is confirmed only by the recipient.
+ */
+const MAX_RETRY_ATTEMPTS = 3
+const RETRY_BACKOFF_MS = [5 * 60_1000, 30 * 60_1000, 2 * 60 * 60_1000]
+
 export async function retryFailedDadPushes(
   db: D1Database,
   env: DadPushEnv,
   maxRetries = 5,
-): Promise<{ retried: number; sent: number; failed: number }> {
-  const out = { retried: 0, sent: 0, failed: 0 }
+): Promise<{ retried: number; sent: number; failed: number; deferred: number }> {
+  const out = { retried: 0, sent: 0, failed: 0, deferred: 0 }
   const now = new Date().toISOString()
+  const nowMs = Date.now()
 
   // Gate: same pilot + kill switch as the send path.
   const mode = await db
@@ -193,20 +223,41 @@ export async function retryFailedDadPushes(
 
   const failed = await db
     .prepare(
-      `SELECT id, complaint_id, failure_reason FROM notifications
-       WHERE recipient_user_id=? AND channel='PUSH' AND event_type='COMPLAINT_RECEIVED'
-       AND status='FAILED' ORDER BY created_at LIMIT ?`,
+      `SELECT n.id, n.complaint_id, n.failure_reason, n.failed_at, c.ingestion_mode
+       FROM notifications n LEFT JOIN complaints c ON c.id = n.complaint_id
+       WHERE n.recipient_user_id=? AND n.channel='PUSH' AND n.event_type='COMPLAINT_RECEIVED'
+       AND n.status='FAILED' ORDER BY n.created_at LIMIT ?`,
     )
     .bind(DAD_USER_ID, maxRetries)
-    .all<{ id: string; complaint_id: string; failure_reason: string | null }>()
+    .all<{
+      id: string
+      complaint_id: string
+      failure_reason: string | null
+      failed_at: string | null
+      ingestion_mode: string | null
+    }>()
   for (const row of failed.results) {
-    // Atomic reservation: only proceed if we won the race.
+    // Never retry non-LIVE (historical BACKFILL/TEST).
+    if (row.ingestion_mode !== 'LIVE') continue
+    // Cumulative retry limit + backoff.
+    const attemptMatch = /^RETRY_(\d+)/.exec(row.failure_reason ?? '')
+    const attempts = attemptMatch ? parseInt(attemptMatch[1], 10) : 1
+    if (attempts >= MAX_RETRY_ATTEMPTS) continue
+    const backoff = RETRY_BACKOFF_MS[Math.min(attempts - 1, RETRY_BACKOFF_MS.length - 1)]
+    const failedAtMs = row.failed_at ? Date.parse(row.failed_at) : 0
+    if (Number.isFinite(failedAtMs) && nowMs - failedAtMs < backoff) {
+      out.deferred += 1
+      continue
+    }
+    // Atomic reservation: exactly one row must flip, or another worker won.
     const reserved = await db
       .prepare(`UPDATE notifications SET status='RETRYING' WHERE id=? AND status='FAILED'`)
       .bind(row.id)
       .run()
-    if (!reserved.success || (reserved as unknown as { changes?: number }).changes === 0) continue
+    const changes = (reserved as unknown as { meta?: { changes?: number } }).meta?.changes ?? 0
+    if (!reserved.success || changes !== 1) continue
     out.retried += 1
+    const nextAttempt = attempts + 1
     try {
       const sub = await db
         .prepare(
@@ -217,12 +268,11 @@ export async function retryFailedDadPushes(
       if (!sub) {
         await db
           .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
-          .bind('RETRY_NO_SUBSCRIPTION', now, row.id)
+          .bind(`RETRY_${nextAttempt}:NO_SUBSCRIPTION`, now, row.id)
           .run()
         out.failed += 1
         continue
       }
-      // Rebuild the payload from the complaint (no customer data).
       const complaint = await db
         .prepare(`SELECT external_case_id, category, store_id FROM complaints WHERE id=?`)
         .bind(row.complaint_id)
@@ -250,7 +300,7 @@ export async function retryFailedDadPushes(
           .run()
         await db
           .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
-          .bind('RETRY_SUBSCRIPTION_EXPIRED', now, row.id)
+          .bind(`RETRY_${nextAttempt}:SUBSCRIPTION_EXPIRED`, now, row.id)
           .run()
         out.failed += 1
       } else {
@@ -261,10 +311,23 @@ export async function retryFailedDadPushes(
         out.sent += 1
       }
     } catch (error) {
-      await db
-        .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
-        .bind(`RETRY_FAILED: ${(error as Error).message.slice(0, 300)}`, now, row.id)
-        .run()
+      const msg = (error as Error).message
+      // Uncertain outcomes (timeout/5xx after submit): do NOT auto-resend.
+      // Mark for human reconciliation — resending could double-notify.
+      const uncertain = /timeout|timed out|5\d\d|network|econn|socket/i.test(msg)
+      if (uncertain) {
+        await db
+          .prepare(
+            `UPDATE notifications SET status='NEEDS_RECONCILIATION', failure_reason=?, failed_at=? WHERE id=?`,
+          )
+          .bind(`RETRY_${nextAttempt}:UNCERTAIN:${msg.slice(0, 200)}`, now, row.id)
+          .run()
+      } else {
+        await db
+          .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
+          .bind(`RETRY_${nextAttempt}:${msg.slice(0, 200)}`, now, row.id)
+          .run()
+      }
       out.failed += 1
     }
   }

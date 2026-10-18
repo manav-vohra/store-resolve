@@ -67,11 +67,11 @@ const TICK_MAX_MESSAGES = 25
  */
 const TICK_MAILBOX_KEY = 'production'
 /**
- * First-run safety: without an initial date boundary, the first delta sync
- * could pull historical mail and ingest it as LIVE. Require an explicit
- * start date; the tick refuses to run without one until a cursor exists.
+ * First-run safety: the activation boundary must be explicitly approved and
+ * stored in settings ('discovery_activation_boundary', ISO timestamp) before
+ * the tick runs without a cursor. This prevents historical mailbox messages
+ * from being ingested as LIVE on first activation. Never hardcode a date.
  */
-const TICK_INITIAL_RECEIVED_START = '2026-10-18T00:00:00.000Z'
 
 export async function runDadPilotDiscoveryTick(
   env: DadPilotTickEnv,
@@ -115,14 +115,25 @@ export async function runDadPilotDiscoveryTick(
   })
   if (!provider.ready) return { ...empty, reason: 'GRAPH_NOT_CONFIGURED' }
 
-  // Gate 5: first-run safety. If no cursor exists yet, require the initial
-  // date boundary so we never ingest historical mail as LIVE.
+  // Gate 5: first-run safety. If no cursor exists yet, require an explicitly
+  // approved activation boundary (settings key 'discovery_activation_boundary',
+  // ISO timestamp). Without it, refuse — never ingest historical mail as LIVE
+  // on a guess. The owner sets this once before activation.
   const cursor = await db
     .prepare(`SELECT cursor_value FROM mail_discovery_cursors WHERE provider=? AND mailbox_key=? AND scope=?`)
     .bind('MICROSOFT_GRAPH', TICK_MAILBOX_KEY, DISCOVERY_SCOPE_INBOX_DELTA)
     .first<{ cursor_value: string | null }>()
   const hasCursor = Boolean(cursor?.cursor_value)
-  const receivedStart = hasCursor ? undefined : TICK_INITIAL_RECEIVED_START
+  let receivedStart: string | undefined
+  if (!hasCursor) {
+    const boundary = await db
+      .prepare(`SELECT value FROM settings WHERE key='discovery_activation_boundary'`)
+      .first<{ value: string }>()
+    const boundaryMs = boundary?.value ? Date.parse(boundary.value) : NaN
+    if (!Number.isFinite(boundaryMs))
+      return { ...empty, reason: 'NEEDS_ACTIVATION_BOUNDARY' }
+    receivedStart = new Date(boundaryMs).toISOString()
+  }
 
   let messagesSeen = 0
   const result = await runMailboxDiscovery(db, {

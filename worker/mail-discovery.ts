@@ -248,6 +248,9 @@ export async function runMailboxDiscovery(
   try {
     for (let page = 0; page < maxPages; page += 1) {
       let delta: InboxDeltaPage
+      // Per-page failure count for checkpoint decisions. A page is only
+      // checkpointed when every message on it was fully processed.
+      let pageFailures = 0
       try {
         // Only the initial call (no link) carries the date window. Continuation
         // links already encode Graph's paging state; passing a filter with
@@ -294,6 +297,7 @@ export async function runMailboxDiscovery(
           metadata = normalizeGraphMessage(graphMessage)
         } catch {
           result.failures += 1
+          pageFailures += 1
           if (graphMessage.id) result.failedIds.push(graphMessage.id)
           continue
         }
@@ -314,6 +318,7 @@ export async function runMailboxDiscovery(
         } catch {
           result.discovered += 1
           result.failures += 1
+          pageFailures += 1
           result.failedIds.push(metadata.id)
           continue
         }
@@ -336,8 +341,21 @@ export async function runMailboxDiscovery(
           if (error instanceof DiscoveryBudgetExhausted) throw error
           result.discovered += 1
           result.failures += 1
+          pageFailures += 1
           result.failedIds.push(full.id)
         }
+      }
+      // Page-level checkpoint: after a fully processed page (zero failures),
+      // persist the nextLink so the next run resumes from the next page
+      // instead of replaying this one. Never checkpoint a partially
+      // processed or failed page — those must be re-processed from the
+      // previous cursor.
+      if (pageFailures === 0 && delta.nextLink && !delta.deltaLink) {
+        await writeCursor(db, provider, mailboxKey, scope, {
+          cursorValue: delta.nextLink,
+          highWaterReceivedAt: highWater,
+        })
+        result.cursorUpdated = true
       }
       if (delta.deltaLink) {
         // Durable cursor rule: NEVER advance past failures. If any message in

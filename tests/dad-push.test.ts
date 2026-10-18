@@ -14,6 +14,7 @@ import type { D1Database } from '../worker/d1'
 // Minimal fake D1 serving canned rows.
 function fakeDb(opts: {
   mode?: string
+  pushEnabled?: boolean
   subscription?: { endpoint: string; p256dh_key: string; auth_key: string } | null
   alreadySent?: boolean
 }) {
@@ -22,6 +23,8 @@ function fakeDb(opts: {
     prepare(sql: string) {
       const first = async () => {
         if (sql.includes('notification_mode')) return opts.mode ? { value: opts.mode } : null
+        if (sql.includes('dad_push_enabled'))
+          return opts.pushEnabled ? { value: 'true' } : null
         if (sql.includes('push_subscriptions')) return opts.subscription ?? null
         if (sql.includes("channel='PUSH'")) return opts.alreadySent ? { id: 'x' } : null
         return null
@@ -76,6 +79,7 @@ describe('notifyDadNewComplaint gating', () => {
     // queried a wrong key, the fake returns null and the gate must fail
     // closed rather than open.
     const db = fakeDb({
+      pushEnabled: true,
       subscription: { endpoint: 'https://push.test/e', p256dh_key: 'p', auth_key: 'a' },
     })
     const result = await notifyDadNewComplaint(db, env, liveComplaint)
@@ -86,6 +90,7 @@ describe('notifyDadNewComplaint gating', () => {
   it('fails closed when not in FAMILY_PILOT', async () => {
     const db = fakeDb({
       mode: 'MOCK',
+      pushEnabled: true,
       subscription: { endpoint: 'https://push.test/e', p256dh_key: 'p', auth_key: 'a' },
     })
     const result = await notifyDadNewComplaint(db, env, liveComplaint)
@@ -94,16 +99,31 @@ describe('notifyDadNewComplaint gating', () => {
   })
 
   it('skips when Dad has no active subscription, audited as SKIPPED', async () => {
-    const db = fakeDb({ mode: 'FAMILY_PILOT', subscription: null })
+    const db = fakeDb({ mode: 'FAMILY_PILOT', pushEnabled: true, subscription: null })
     const result = await notifyDadNewComplaint(db, env, liveComplaint)
     expect(result.sent).toBe(false)
     expect(result.reason).toBe('NO_PUSH_SUBSCRIPTION')
     expect((db as unknown as { _state: { notified: string[] } })._state.notified.length).toBe(1)
   })
 
+  it('never sends when dad_push_enabled is false, even for LIVE', async () => {
+    // Regression: POST /api/complaints calls notifyDadNewComplaint directly.
+    // The kill switch must be enforced INSIDE the function, not just by
+    // callers, or manual LIVE creation bypasses it.
+    const db = fakeDb({
+      mode: 'FAMILY_PILOT',
+      subscription: { endpoint: 'https://push.test/e', p256dh_key: 'p', auth_key: 'a' },
+    })
+    // fakeDb returns null for dad_push_enabled (not set) -> gate fails closed
+    const result = await notifyDadNewComplaint(db, env, liveComplaint)
+    expect(result.sent).toBe(false)
+    expect(result.reason).toBe('PUSH_DISABLED')
+  })
+
   it('is idempotent per complaint', async () => {
     const db = fakeDb({
       mode: 'FAMILY_PILOT',
+      pushEnabled: true,
       subscription: { endpoint: 'https://push.test/e', p256dh_key: 'p', auth_key: 'a' },
       alreadySent: true,
     })
