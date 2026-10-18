@@ -42,6 +42,21 @@ describe('complaint creation and routing', () => {
     expect(r.complaint.routingConfidence).toBe('REVIEW')
     expect(r.complaint.notifications).toHaveLength(3)
   })
+  it('creates complaint when store has NO assigned manager (prod: all stores manager_id NULL)', () => {
+    // Oct 17: all 6 BACKFILL imports failed with FAILED_PERSISTENCE because
+    // createComplaint unconditionally notified store.managerId, which was
+    // null for every prod store. Must create the complaint + MANAGER_NOT_ASSIGNED
+    // event instead of throwing.
+    const noManagerState = structuredClone(state)
+    for (const s of noManagerState.stores) s.managerId = undefined as unknown as string
+    const r = createComplaint(noManagerState, input, received)
+    expect(r.complaint.storeId).toBe('store-1')
+    expect(r.complaint.status).toBe('MANAGER_NOTIFIED')
+    expect(r.complaint.events.map((e) => e.type)).toContain('MANAGER_NOT_ASSIGNED')
+    // Owner notifications still created; no manager notification.
+    expect(r.complaint.notifications.length).toBeGreaterThan(0)
+    expect(r.complaint.notifications.every((n) => n.eventType !== 'MANAGER_NOTIFIED')).toBe(true)
+  })
   it('treats duplicate external case as follow-up without creating a second complaint', () => {
     const first = create()
     const second = createComplaint(

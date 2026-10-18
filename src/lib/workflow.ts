@@ -73,7 +73,9 @@ function notification(
   message: string,
   now: string,
 ): Notification {
-  const recipient = state.users.find((u) => u.id === recipientId)!
+  const recipient = state.users.find((u) => u.id === recipientId)
+  if (!recipient)
+    throw new Error(`Notification recipient not found: ${String(recipientId)}`)
   const eligible = eligibility(recipient, state.config, complaint.storeId)
   return {
     id: id('ntf'),
@@ -202,26 +204,45 @@ export function createComplaint(
     now,
   )
   if (store) {
-    const managerNotification = notification(
-      next,
-      complaint,
-      store.managerId,
-      'MANAGER_NOTIFIED',
-      `New complaint ${complaint.id} requires your acknowledgment.`,
-      now,
-    )
-    complaint.notifications.push(managerNotification)
-    complaint.events.push(
-      event(
-        complaint.id,
-        managerNotification.status === 'PENDING'
-          ? 'MANAGER_NOTIFICATION_PLANNED'
-          : 'MANAGER_NOTIFICATION_SUPPRESSED',
-        'system',
+    // Stores may have NO assigned manager (prod: all 6 active stores have
+    // manager_id NULL — Dad is OWNER, not a store manager). Previously this
+    // unconditionally called notification() with a null managerId, which
+    // threw (recipient not found) and failed the entire import with
+    // FAILED_PERSISTENCE for every message. Only notify a manager when one
+    // is actually assigned AND exists in state.users; otherwise record that
+    // no manager was assigned and continue — the complaint is still created.
+    const manager = store.managerId
+      ? next.users.find((u) => u.id === store.managerId)
+      : undefined
+    if (manager) {
+      const managerNotification = notification(
+        next,
+        complaint,
+        manager.id,
+        'MANAGER_NOTIFIED',
+        `New complaint ${complaint.id} requires your acknowledgment.`,
         now,
-        { notificationId: managerNotification.id },
-      ),
-    )
+      )
+      complaint.notifications.push(managerNotification)
+      complaint.events.push(
+        event(
+          complaint.id,
+          managerNotification.status === 'PENDING'
+            ? 'MANAGER_NOTIFICATION_PLANNED'
+            : 'MANAGER_NOTIFICATION_SUPPRESSED',
+          'system',
+          now,
+          { notificationId: managerNotification.id },
+        ),
+      )
+    } else {
+      complaint.events.push(
+        event(complaint.id, 'MANAGER_NOT_ASSIGNED', 'system', now, {
+          reason: 'STORE_HAS_NO_ASSIGNED_MANAGER',
+          storeId: store.id,
+        }),
+      )
+    }
   }
   next.complaints.unshift(complaint)
   return { state: next, complaint, duplicate: false }

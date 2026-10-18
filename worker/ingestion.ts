@@ -976,11 +976,18 @@ export async function ingestEmailMessage(
     await foundation.finishProcessing(lease, 'REVIEW_REQUIRED', now)
     return { status: 'REVIEW_REQUIRED' }
   } catch (error) {
+    // Store the message (truncated), not just the name — "Error" alone is
+    // undiagnosable. Oct 17: all 6 imports failed with detail "Error",
+    // hiding the real cause (null store managerId in createComplaint).
+    const detail =
+      error instanceof Error
+        ? `${error.name}: ${error.message}`.slice(0, 500)
+        : 'UNKNOWN'
     await db
       .prepare(
         `UPDATE gmail_messages SET processing_status='FAILED_PERSISTENCE',processing_detail=?,updated_at=? WHERE gmail_message_id=?`,
       )
-      .bind(error instanceof Error ? error.name : 'UNKNOWN', now, message.id)
+      .bind(detail, now, message.id)
       .run()
     await recordIntegrationEvent(
       db,
@@ -989,12 +996,7 @@ export async function ingestEmailMessage(
       'FAILED',
       'FAILED_PERSISTENCE',
     )
-    await foundation.finishProcessing(
-      lease,
-      'RETRY_WAIT',
-      now,
-      error instanceof Error ? error.name : 'UNKNOWN',
-    )
+    await foundation.finishProcessing(lease, 'RETRY_WAIT', now, detail)
     throw error
   }
 }

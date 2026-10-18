@@ -198,13 +198,22 @@ export async function loadPreviewDedupSets(db: D1Database, messageIds: string[],
   const alreadyIngestedIds = new Set<string>()
   if (messageIds.length > 0) {
     const placeholders = messageIds.map(() => '?').join(',')
+    // Only messages WITH a linked complaint count as ingested. A message
+    // that failed persistence (FAILED_PERSISTENCE, no complaint) must stay
+    // retryable — Oct 17: 2 messages were marked "Already ingested" with
+    // no complaint, blocking retry via UI. Link via complaint_sources
+    // (foundation path) or gmail_messages.complaint_id (legacy path).
     const rows = await db
-      .prepare(`SELECT id FROM mail_source_messages WHERE id IN (${placeholders})`)
+      .prepare(
+        `SELECT DISTINCT cs.source_message_id AS id FROM complaint_sources cs WHERE cs.source_message_id IN (${placeholders})`,
+      )
       .bind(...messageIds)
       .all<{ id: string }>()
     for (const row of rows.results) alreadyIngestedIds.add(row.id)
     const legacy = await db
-      .prepare(`SELECT gmail_message_id AS id FROM gmail_messages WHERE gmail_message_id IN (${placeholders})`)
+      .prepare(
+        `SELECT gmail_message_id AS id FROM gmail_messages WHERE gmail_message_id IN (${placeholders}) AND complaint_id IS NOT NULL`,
+      )
       .bind(...messageIds)
       .all<{ id: string }>()
     for (const row of legacy.results) alreadyIngestedIds.add(row.id)
