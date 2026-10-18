@@ -262,15 +262,25 @@ export function encodePageToken(
   void expectedWindow
   let url: URL
   try {
-    url = new URL(nextLink)
+    // Graph nextLink is usually absolute, but may be relative — resolve
+    // relative links against the Graph root instead of rejecting them.
+    url = nextLink.startsWith('/')
+      ? new URL(nextLink, 'https://graph.microsoft.com')
+      : new URL(nextLink)
   } catch {
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is malformed')
   }
-  // Must be the approved Inbox endpoint only — never /me/messages, never Sent Items, never other hosts.
+  // Must be Graph, under /v1.0/me/ (same mailbox scope). We do NOT require
+  // the exact Inbox path: Graph may normalize the nextLink path (e.g. to
+  // /v1.0/me/messages), and we REBUILD with the Inbox path + original
+  // window anyway, so the nextLink's path cannot widen scope. The
+  // security boundary is: Graph host + /me/ scope + valid paging state.
+  // Rejecting on exact path caused false rejections (Oct 17: real Graph
+  // nextLinks were rejected, breaking all pagination).
   if (url.protocol !== 'https:' || url.hostname !== 'graph.microsoft.com')
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink host is not trusted')
-  if (url.pathname !== '/v1.0/me/mailFolders/inbox/messages')
-    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink must target Inbox messages')
+  if (!url.pathname.startsWith('/v1.0/me/'))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink must target /me/ scope')
   if (url.username || url.password || url.hash || (url.port !== '' && url.port !== '443'))
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is invalid')
   if (url.pathname.includes('..') || url.pathname.includes('\\'))
