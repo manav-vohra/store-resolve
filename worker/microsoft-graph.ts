@@ -272,16 +272,22 @@ export function encodePageToken(
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is invalid')
   if (url.pathname.includes('..') || url.pathname.includes('\\'))
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink path is invalid')
-  // $filter must match the original window — pagination must not widen scope.
-  // Normalize whitespace: Graph may URL-encode or re-space the filter.
+  // $filter / $orderby: Graph's nextLink often OMITS them (it contains only
+  // $skip/$skiptoken/$top, with the original query implied by the
+  // continuation). That is valid — the continuation is still scoped to the
+  // original query because WE rebuild the URL with the original window
+  // filter + paging state. Only validate them when Graph DOES include
+  // them: if present, they must match the original window/orderby, or
+  // the nextLink is rejected. Never accept a present-but-different filter.
   const normalizeFilter = (s: string) => s.replace(/\s+/g, ' ').trim()
   const filter = url.searchParams.get('$filter')
-  const expectedFilter = `receivedDateTime ge ${expectedWindow.receivedStart} and receivedDateTime lt ${expectedWindow.receivedEnd}`
-  if (!filter || normalizeFilter(filter) !== normalizeFilter(expectedFilter))
-    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink filter does not match original window')
-  // $orderby must be the same (receivedDateTime desc) — no reordering.
+  if (filter !== null) {
+    const expectedFilter = `receivedDateTime ge ${expectedWindow.receivedStart} and receivedDateTime lt ${expectedWindow.receivedEnd}`
+    if (normalizeFilter(filter) !== normalizeFilter(expectedFilter))
+      throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink filter does not match original window')
+  }
   const orderby = url.searchParams.get('$orderby')
-  if (!orderby || orderby.replace(/\s+/g, ' ').trim() !== 'receivedDateTime desc')
+  if (orderby !== null && orderby.replace(/\s+/g, ' ').trim() !== 'receivedDateTime desc')
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink orderby does not match')
   // Paging state: $skip (integer) and/or $skiptoken (opaque). At least one must be present.
   const skipRaw = url.searchParams.get('$skip')

@@ -55,6 +55,23 @@ describe('Graph pagination opaque continuation', () => {
     expect(decoded.top).toBe(25)
   })
 
+  it('accepts Graph nextLink that omits $filter/$orderby (only $skip/$top)', () => {
+    // Real Graph behavior: nextLink for $skip pagination often contains
+    // ONLY $skip + $top, with the original query implied. This is valid —
+    // the server rebuilds with the original window filter. The Oct 17
+    // prod failure was caused by rejecting these nextLinks.
+    const link = nextLink({ $top: '50', $skip: '50' })
+    const token = encodePageToken(link, WINDOW)
+    const decoded = decodePageToken(token!)
+    expect(decoded.skip).toBe(50)
+    expect(decoded.top).toBe(50)
+  })
+
+  it('rejects nextLink with present-but-wrong $filter', () => {
+    const link = nextLink({ $filter: 'receivedDateTime ge 2026-01-01T00:00:00.000Z', $top: '50', $skip: '50' })
+    expectPaginationError(() => encodePageToken(link, WINDOW))
+  })
+
   it('rejects nextLink with wrong host', () => {
     const link = `https://evil.example.com/v1.0/me/mailFolders/inbox/messages?${new URLSearchParams({ $filter: FILTER, $orderby: 'receivedDateTime desc', $skip: '10' }).toString()}`
     expectPaginationError(() => encodePageToken(link, WINDOW))
