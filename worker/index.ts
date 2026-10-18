@@ -357,38 +357,47 @@ app.get('/api/admin/email/readiness', async (c) => {
 // Rejects ?nextLink= : browser-provided Graph URLs are never fetched. The
 // server rebuilds the Inbox URL from pageToken + window.
 app.get('/api/admin/email/preview', async (c) => {
-  const user = c.get('user')
-  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
-  const state = await loadState(c.env.DB)
-  if (state.config.mode !== 'FAMILY_PILOT')
-    return c.json(jsonError('Preview is only available in FAMILY_PILOT'), 409)
-  const graph = emailProvider(c.env)
-  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
-  if (c.req.query('nextLink'))
-    return c.json(jsonError('Use pageToken, not nextLink'), 400)
-  const start = c.req.query('start') || DEFAULT_PREVIEW_WINDOW.receivedStart
-  const end = c.req.query('end') || DEFAULT_PREVIEW_WINDOW.receivedEnd
-  const windowCheck = validatePreviewWindow(start, end)
-  if (!windowCheck.ok) return c.json(jsonError(windowCheck.error), 400)
-  const top = Math.max(1, Math.min(100, Number(c.req.query('top') ?? 50) || 50))
+  // DIAGNOSTIC (Oct 18): preview 500s with blank "Internal Server Error".
+  // Wrap the whole handler so the real error message is surfaced instead of
+  // Hono's generic 500 page. Remove once the root cause is fixed.
   try {
-    const result = await runMailPreview(
-      c.env.DB,
-      graph,
-      { receivedStart: start, receivedEnd: end },
-      top,
-      c.req.query('pageToken') || undefined,
-    )
-    return c.json({
-      ok: true,
-      window: { receivedStart: start, receivedEnd: end },
-      count: result.items.length,
-      items: result.items,
-      nextPageToken: result.nextPageToken ?? null,
-    })
+    const user = c.get('user')
+    if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+    const state = await loadState(c.env.DB)
+    if (state.config.mode !== 'FAMILY_PILOT')
+      return c.json(jsonError('Preview is only available in FAMILY_PILOT'), 409)
+    const graph = emailProvider(c.env)
+    if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+    if (c.req.query('nextLink'))
+      return c.json(jsonError('Use pageToken, not nextLink'), 400)
+    const start = c.req.query('start') || DEFAULT_PREVIEW_WINDOW.receivedStart
+    const end = c.req.query('end') || DEFAULT_PREVIEW_WINDOW.receivedEnd
+    const windowCheck = validatePreviewWindow(start, end)
+    if (!windowCheck.ok) return c.json(jsonError(windowCheck.error), 400)
+    const top = Math.max(1, Math.min(100, Number(c.req.query('top') ?? 50) || 50))
+    try {
+      const result = await runMailPreview(
+        c.env.DB,
+        graph,
+        { receivedStart: start, receivedEnd: end },
+        top,
+        c.req.query('pageToken') || undefined,
+      )
+      return c.json({
+        ok: true,
+        window: { receivedStart: start, receivedEnd: end },
+        count: result.items.length,
+        items: result.items,
+        nextPageToken: result.nextPageToken ?? null,
+      })
+    } catch (error) {
+      const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_FAILED'
+      const detail = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 500) : 'UNKNOWN'
+      return c.json({ ...jsonError(code), detail }, 503)
+    }
   } catch (error) {
-    const code = error instanceof EmailProviderError ? error.code : 'PREVIEW_FAILED'
-    return c.json(jsonError(code), 503)
+    const detail = error instanceof Error ? `${error.name}: ${error.message}`.slice(0, 500) : 'UNKNOWN'
+    return c.json({ ...jsonError('PREVIEW_SETUP_FAILED'), detail }, 500)
   }
 })
 
