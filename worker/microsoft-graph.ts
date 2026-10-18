@@ -255,8 +255,11 @@ function base64UrlDecode(token: string): string | null {
 /** Validates a Graph nextLink and encodes its paging state as an opaque token. */
 export function encodePageToken(
   nextLink: string,
+  // Kept for signature stability; filter is ignored (see below) so the
+  // window is not used. Referenced to satisfy the linter.
   expectedWindow: { receivedStart: string; receivedEnd: string },
 ): string | null {
+  void expectedWindow
   let url: URL
   try {
     url = new URL(nextLink)
@@ -272,23 +275,16 @@ export function encodePageToken(
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is invalid')
   if (url.pathname.includes('..') || url.pathname.includes('\\'))
     throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink path is invalid')
-  // $filter / $orderby: Graph's nextLink often OMITS them (it contains only
-  // $skip/$skiptoken/$top, with the original query implied by the
-  // continuation). That is valid — the continuation is still scoped to the
-  // original query because WE rebuild the URL with the original window
-  // filter + paging state. Only validate them when Graph DOES include
-  // them: if present, they must match the original window/orderby, or
-  // the nextLink is rejected. Never accept a present-but-different filter.
-  const normalizeFilter = (s: string) => s.replace(/\s+/g, ' ').trim()
-  const filter = url.searchParams.get('$filter')
-  if (filter !== null) {
-    const expectedFilter = `receivedDateTime ge ${expectedWindow.receivedStart} and receivedDateTime lt ${expectedWindow.receivedEnd}`
-    if (normalizeFilter(filter) !== normalizeFilter(expectedFilter))
-      throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink filter does not match original window')
-  }
-  const orderby = url.searchParams.get('$orderby')
-  if (orderby !== null && orderby.replace(/\s+/g, ' ').trim() !== 'receivedDateTime desc')
-    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink orderby does not match')
+  // $filter / $orderby in the nextLink are IGNORED, not validated strictly.
+  // Graph normalizes the filter (e.g. strips .000 from datetimes,
+  // re-orders clauses) and may omit filter/orderby entirely (only
+  // $skip/$top). Strict matching caused false rejections (Oct 17: page 1
+  // errored because Graph's nextLink filter datetime format differed).
+  // This is safe: the server REBUILDS the URL with the original window
+  // filter + orderby + paging state — the nextLink's filter/orderby are
+  // never used, so they cannot widen scope. The security boundary is:
+  // host/path must be Inbox messages, and paging state must be valid.
+  // (expectedWindow is kept for future use / signature stability.)
   // Paging state: $skip (integer) and/or $skiptoken (opaque). At least one must be present.
   const skipRaw = url.searchParams.get('$skip')
   const skiptoken = url.searchParams.get('$skiptoken')

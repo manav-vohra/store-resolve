@@ -67,9 +67,13 @@ describe('Graph pagination opaque continuation', () => {
     expect(decoded.top).toBe(50)
   })
 
-  it('rejects nextLink with present-but-wrong $filter', () => {
+  it('ignores nextLink $filter (server rebuilds with original window)', () => {
+    // Graph normalizes filter datetimes (e.g. strips .000), so strict
+    // matching causes false rejections. The server ignores the nextLink
+    // filter and rebuilds with the original window, so it cannot widen scope.
     const link = nextLink({ $filter: 'receivedDateTime ge 2026-01-01T00:00:00.000Z', $top: '50', $skip: '50' })
-    expectPaginationError(() => encodePageToken(link, WINDOW))
+    const token = encodePageToken(link, WINDOW)
+    expect(decodePageToken(token!).skip).toBe(50)
   })
 
   it('rejects nextLink with wrong host', () => {
@@ -84,14 +88,14 @@ describe('Graph pagination opaque continuation', () => {
     }
   })
 
-  it('rejects nextLink with widened $filter (different window)', () => {
-    const link = nextLink({ $filter: 'receivedDateTime ge 2026-01-01T00:00:00.000Z and receivedDateTime lt 2026-12-31T23:59:59.999Z', $orderby: 'receivedDateTime desc', $skip: '10' })
-    expectPaginationError(() => encodePageToken(link, WINDOW))
-  })
-
-  it('rejects nextLink with different $orderby', () => {
-    const link = nextLink({ $filter: FILTER, $orderby: 'subject asc', $skip: '10' })
-    expectPaginationError(() => encodePageToken(link, WINDOW))
+  it('ignores nextLink $filter/$orderby (server rebuilds with original)', () => {
+    // Graph normalizes filter datetimes and may reorder; strict matching
+    // caused false rejections. Server ignores nextLink filter/orderby and
+    // rebuilds with original window, so they cannot widen scope.
+    const link1 = nextLink({ $filter: 'receivedDateTime ge 2026-01-01T00:00:00.000Z and receivedDateTime lt 2026-12-31T23:59:59.999Z', $orderby: 'receivedDateTime desc', $skip: '10' })
+    expect(decodePageToken(encodePageToken(link1, WINDOW)!).skip).toBe(10)
+    const link2 = nextLink({ $filter: FILTER, $orderby: 'subject asc', $skip: '10' })
+    expect(decodePageToken(encodePageToken(link2, WINDOW)!).skip).toBe(10)
   })
 
   it('rejects nextLink with no paging state', () => {
