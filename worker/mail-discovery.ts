@@ -78,6 +78,20 @@ export class FakeDeltaDiscoveryClient implements DeltaDiscoveryClient {
 export const DISCOVERY_SCOPE_INBOX_DELTA = 'inbox-delta'
 const MAX_PAGES_DEFAULT = 10
 
+/**
+ * Thrown by an ingest function when a processing budget is exhausted.
+ * Unlike other ingest errors, this stops the discovery loop entirely
+ * (rather than skipping one message) and guarantees the cursor does NOT
+ * advance past unprocessed messages. The next run resumes from the
+ * previous cursor; already-processed messages dedupe via DUPLICATE.
+ */
+export class DiscoveryBudgetExhausted extends Error {
+  constructor(message = 'Discovery processing budget exhausted') {
+    super(message)
+    this.name = 'DiscoveryBudgetExhausted'
+  }
+}
+
 export interface MailboxDiscoveryOptions {
   provider: 'MICROSOFT_GRAPH'
   mailboxKey: string
@@ -98,7 +112,7 @@ export interface MailboxDiscoveryOptions {
 
 export interface MailboxDiscoveryResult {
   ran: boolean
-  reason?: 'INGESTION_DISABLED' | 'DISCOVERY_FAILED' | 'DISCOVERY_PARTIAL_FAILURES'
+  reason?: 'INGESTION_DISABLED' | 'DISCOVERY_FAILED' | 'DISCOVERY_PARTIAL_FAILURES' | 'BUDGET_EXHAUSTED'
   discovered: number
   ingested: number
   skipped: number
@@ -315,7 +329,11 @@ export async function runMailboxDiscovery(
             result.discovered += 1
             result.ingested += 1
           }
-        } catch {
+        } catch (error) {
+          // Budget exhaustion stops the whole run: do not process further
+          // messages, do not advance the cursor. The next run resumes from
+          // the previous cursor.
+          if (error instanceof DiscoveryBudgetExhausted) throw error
           result.discovered += 1
           result.failures += 1
           result.failedIds.push(full.id)
@@ -370,6 +388,14 @@ export async function runMailboxDiscovery(
     }
     return result
   } catch (error) {
+    // Budget exhaustion: stop cleanly without advancing the cursor.
+    // The next run resumes from the previous cursor; nothing is lost.
+    if (error instanceof DiscoveryBudgetExhausted) {
+      await writeCursor(db, provider, mailboxKey, scope, {
+        lastErrorCode: 'BUDGET_EXHAUSTED',
+      })
+      return { ...result, reason: 'BUDGET_EXHAUSTED', errorCode: 'BUDGET_EXHAUSTED' }
+    }
     const code = error instanceof EmailProviderError ? error.code : 'DISCOVERY_FAILED'
     await writeCursor(db, provider, mailboxKey, scope, { lastErrorCode: code })
     return { ...result, reason: 'DISCOVERY_FAILED', errorCode: code }

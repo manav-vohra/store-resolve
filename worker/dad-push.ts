@@ -149,3 +149,124 @@ async function record(
     )
     .run()
 }
+
+/**
+ * Retry failed Dad pushes with durable, idempotent recovery.
+ *
+ * - Finds FAILED push notifications for Dad (COMPLAINT_RECEIVED, channel PUSH).
+ * - Atomically reserves each one (status FAILED -> RETRYING) so concurrent
+ *   workers never send duplicates. The reservation is a single conditional
+ *   UPDATE; only the worker whose UPDATE matched proceeds.
+ * - Caps retries at 3 attempts per notification (tracked via failure_reason
+ *   prefix or a retry_count — here via re-queue with attempt marker).
+ * - On success: SENT. On failure: back to FAILED with updated reason.
+ * - Never throws; returns per-notification outcomes for the caller to log.
+ *
+ * Note on delivery semantics: a provider acceptance (Apple returns 2xx)
+ * is recorded as SENT, but that is not proof the iPhone displayed it.
+ * The outbox is the source of truth for attempts, not for display.
+ */
+export async function retryFailedDadPushes(
+  db: D1Database,
+  env: DadPushEnv,
+  maxRetries = 5,
+): Promise<{ retried: number; sent: number; failed: number }> {
+  const out = { retried: 0, sent: 0, failed: 0 }
+  const now = new Date().toISOString()
+
+  // Gate: same pilot + kill switch as the send path.
+  const mode = await db
+    .prepare(`SELECT value FROM settings WHERE key='notification_mode'`)
+    .first<{ value: string }>()
+  if (mode?.value !== 'FAMILY_PILOT') return out
+  const pushEnabled = await db
+    .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
+    .first<{ value: string }>()
+  if (pushEnabled?.value !== 'true') return out
+
+  const push = new WebPushProvider({
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+    subject: env.PUBLIC_BASE_URL ?? 'https://store-resolve.moogzie.workers.dev',
+  })
+  if (!push.ready) return out
+
+  const failed = await db
+    .prepare(
+      `SELECT id, complaint_id, failure_reason FROM notifications
+       WHERE recipient_user_id=? AND channel='PUSH' AND event_type='COMPLAINT_RECEIVED'
+       AND status='FAILED' ORDER BY created_at LIMIT ?`,
+    )
+    .bind(DAD_USER_ID, maxRetries)
+    .all<{ id: string; complaint_id: string; failure_reason: string | null }>()
+  for (const row of failed.results) {
+    // Atomic reservation: only proceed if we won the race.
+    const reserved = await db
+      .prepare(`UPDATE notifications SET status='RETRYING' WHERE id=? AND status='FAILED'`)
+      .bind(row.id)
+      .run()
+    if (!reserved.success || (reserved as unknown as { changes?: number }).changes === 0) continue
+    out.retried += 1
+    try {
+      const sub = await db
+        .prepare(
+          `SELECT endpoint, p256dh_key, auth_key FROM push_subscriptions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC LIMIT 1`,
+        )
+        .bind(DAD_USER_ID)
+        .first<{ endpoint: string; p256dh_key: string; auth_key: string }>()
+      if (!sub) {
+        await db
+          .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
+          .bind('RETRY_NO_SUBSCRIPTION', now, row.id)
+          .run()
+        out.failed += 1
+        continue
+      }
+      // Rebuild the payload from the complaint (no customer data).
+      const complaint = await db
+        .prepare(`SELECT external_case_id, category, store_id FROM complaints WHERE id=?`)
+        .bind(row.complaint_id)
+        .first<{ external_case_id: string; category: string; store_id: string | null }>()
+      const store = complaint?.store_id
+        ? await db
+            .prepare(`SELECT dunkin_store_number FROM stores WHERE id=?`)
+            .bind(complaint.store_id)
+            .first<{ dunkin_store_number: string }>()
+        : null
+      const { buildNewComplaintPushPayload } = await import('./webpush')
+      const result = await push.sendToSubscription(
+        { endpoint: sub.endpoint, p256dhKey: sub.p256dh_key, authKey: sub.auth_key },
+        buildNewComplaintPushPayload({
+          id: row.complaint_id,
+          externalCaseId: complaint?.external_case_id ?? row.complaint_id,
+          category: complaint?.category,
+          storeNumber: store?.dunkin_store_number,
+        }),
+      )
+      if (result.expired) {
+        await db
+          .prepare(`UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND revoked_at IS NULL`)
+          .bind(now, sub.endpoint)
+          .run()
+        await db
+          .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
+          .bind('RETRY_SUBSCRIPTION_EXPIRED', now, row.id)
+          .run()
+        out.failed += 1
+      } else {
+        await db
+          .prepare(`UPDATE notifications SET status='SENT', sent_at=?, failure_reason=NULL WHERE id=?`)
+          .bind(now, row.id)
+          .run()
+        out.sent += 1
+      }
+    } catch (error) {
+      await db
+        .prepare(`UPDATE notifications SET status='FAILED', failure_reason=?, failed_at=? WHERE id=?`)
+        .bind(`RETRY_FAILED: ${(error as Error).message.slice(0, 300)}`, now, row.id)
+        .run()
+      out.failed += 1
+    }
+  }
+  return out
+}

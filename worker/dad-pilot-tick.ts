@@ -9,24 +9,28 @@
  *
  * Safety properties:
  * - Separate from the legacy runScheduledOperations cron (which stays disabled).
- * - Bounded: max 3 delta pages per run, 25 messages per run. The tick never
- *   loads full application state; it uses targeted queries + the existing
- *   discovery cursor table.
+ * - Bounded: max 3 delta pages / 25 messages per run. Budget exhaustion
+ *   throws DiscoveryBudgetExhausted: the loop stops immediately and the
+ *   cursor does NOT advance past unprocessed messages. Next run resumes.
  * - Durable cursor: mail_discovery_cursors persists the delta link; the cursor
- *   never advances past failures (see runMailboxDiscovery).
- * - Dedup: messages already ingested (by graphMessageId) are skipped; a
- *   complaint is created exactly once per message (UNIQUE on external_case_id
- *   + idempotent ingest).
- * - Push: Dad-only (user_id='dad'), LIVE complaints only, durably recorded
- *   in the notifications outbox with SENT/FAILED/SKIPPED; safe to retry.
- *   Provider acceptance (!= iPhone display) is recorded as SENT — the outbox
- *   is the source of truth, not a delivery receipt.
- * - Privacy: push payload contains only case ID, category, store number —
- *   never customer name, email, phone, or complaint text (lock screen safe).
- * - Kill switches: the tick no-ops unless emailIngestionEnabled is true AND
- *   mode is FAMILY_PILOT. External SMS and auto-ack stay off independently.
+ *   never advances past failures.
+ * - First-run safety: uses the SAME cursor key as the manual discovery path
+ *   ('production') and requires an initial date boundary so historical mail
+ *   is never ingested as LIVE on first activation.
+ * - Dedup: messages already ingested are skipped; one complaint per message.
+ * - Push: Dad-only, LIVE only, gated by dad_push_enabled kill switch
+ *   (default OFF). Durably recorded; failed pushes are retryable via the
+ *   outbox (see worker/dad-push.ts). Provider acceptance != device display.
+ * - Privacy: push payload has case ID/category/store only — no customer data.
+ * - Kill switches: no-ops unless FAMILY_PILOT + email_ingestion_enabled.
+ *   SMS and auto-ack stay off independently.
  */
-import { runMailboxDiscovery, DISCOVERY_SCOPE_INBOX_DELTA } from './mail-discovery'
+import {
+  runMailboxDiscovery,
+  DISCOVERY_SCOPE_INBOX_DELTA,
+  GraphDeltaDiscoveryClient,
+  DiscoveryBudgetExhausted,
+} from './mail-discovery'
 import { MicrosoftGraphProvider } from './microsoft-graph'
 import { ingestEmailMessage } from './ingestion'
 import type { D1Database } from './d1'
@@ -55,8 +59,19 @@ export interface DadPilotTickResult {
 
 /** Max delta pages per tick — bounds Graph + D1 work. */
 const TICK_MAX_PAGES = 3
-/** Max messages ingested per tick — bounds complaint creation + push. */
+/** Max messages processed per tick (including duplicates/skips). */
 const TICK_MAX_MESSAGES = 25
+/**
+ * Cursor key shared with the manual discovery path so the scheduled job
+ * resumes from the same position instead of starting over.
+ */
+const TICK_MAILBOX_KEY = 'production'
+/**
+ * First-run safety: without an initial date boundary, the first delta sync
+ * could pull historical mail and ingest it as LIVE. Require an explicit
+ * start date; the tick refuses to run without one until a cursor exists.
+ */
+const TICK_INITIAL_RECEIVED_START = '2026-10-18T00:00:00.000Z'
 
 export async function runDadPilotDiscoveryTick(
   env: DadPilotTickEnv,
@@ -77,47 +92,80 @@ export async function runDadPilotDiscoveryTick(
     .first<{ value: string }>()
   if (mode?.value !== 'FAMILY_PILOT') return { ...empty, reason: 'NOT_FAMILY_PILOT' }
 
-  // Gate 2: scheduled ingestion must be explicitly enabled. This is separate
-  // from the manual preview-import path and from external notifications.
+  // Gate 2: scheduled ingestion must be explicitly enabled.
   const ingestion = await db
     .prepare(`SELECT value FROM settings WHERE key='email_ingestion_enabled'`)
     .first<{ value: string }>()
   if (ingestion?.value !== 'true') return { ...empty, reason: 'INGESTION_DISABLED' }
 
-  // Gate 3: Graph must be configured.
-  const graph = new MicrosoftGraphProvider({
+  // Gate 3: Dad push must be explicitly enabled (separate kill switch).
+  // Deploying code must not authorize real pushes by itself.
+  const pushEnabled = await db
+    .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
+    .first<{ value: string }>()
+  const dadPushOn = pushEnabled?.value === 'true'
+
+  // Gate 4: Graph must be configured.
+  const provider = new MicrosoftGraphProvider({
     clientId: env.MS_CLIENT_ID ?? '',
     clientSecret: env.MS_CLIENT_SECRET ?? '',
     tenant: env.MS_TENANT_ID ?? '',
     refreshToken: env.MS_REFRESH_TOKEN ?? '',
     mailboxAddress: env.MS_MAILBOX_ADDRESS ?? '',
   })
-  if (!graph.ready) return { ...empty, reason: 'GRAPH_NOT_CONFIGURED' }
+  if (!provider.ready) return { ...empty, reason: 'GRAPH_NOT_CONFIGURED' }
 
-  let ingestedCount = 0
+  // Gate 5: first-run safety. If no cursor exists yet, require the initial
+  // date boundary so we never ingest historical mail as LIVE.
+  const cursor = await db
+    .prepare(`SELECT cursor_value FROM mail_discovery_cursors WHERE provider=? AND mailbox_key=? AND scope=?`)
+    .bind('MICROSOFT_GRAPH', TICK_MAILBOX_KEY, DISCOVERY_SCOPE_INBOX_DELTA)
+    .first<{ cursor_value: string | null }>()
+  const hasCursor = Boolean(cursor?.cursor_value)
+  const receivedStart = hasCursor ? undefined : TICK_INITIAL_RECEIVED_START
+
+  let messagesSeen = 0
   const result = await runMailboxDiscovery(db, {
     provider: 'MICROSOFT_GRAPH',
-    mailboxKey: env.MS_MAILBOX_ADDRESS ?? 'production',
+    mailboxKey: TICK_MAILBOX_KEY,
     scope: DISCOVERY_SCOPE_INBOX_DELTA,
     ingestionEnabled: true,
-    client: graph as unknown as import('./mail-discovery').DeltaDiscoveryClient,
+    client: new GraphDeltaDiscoveryClient(provider),
     maxPages: TICK_MAX_PAGES,
+    receivedStart,
     ingest: async (database, message) => {
-      // Bound messages per tick.
-      if (ingestedCount >= TICK_MAX_MESSAGES)
-        return { status: 'SKIPPED_TICK_BOUND', complaintId: undefined }
-      const outcome = await ingestEmailMessage(database, message, {
+      // Genuine processing budget: count every message handed to ingest
+      // (including duplicates). On exhaustion, throw to stop the loop
+      // immediately — the cursor does not advance past unprocessed mail.
+      messagesSeen += 1
+      if (messagesSeen > TICK_MAX_MESSAGES) throw new DiscoveryBudgetExhausted()
+      return ingestEmailMessage(database, message, {
         ingestionMode: 'LIVE',
-        pushEnv: {
-          VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
-          VAPID_PRIVATE_KEY: env.VAPID_PRIVATE_KEY,
-          PUBLIC_BASE_URL: env.PUBLIC_BASE_URL,
-        },
+        pushEnv: dadPushOn
+          ? {
+              VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
+              VAPID_PRIVATE_KEY: env.VAPID_PRIVATE_KEY,
+              PUBLIC_BASE_URL: env.PUBLIC_BASE_URL,
+            }
+          : undefined,
       })
-      if (outcome.complaintId) ingestedCount += 1
-      return outcome
     },
   })
+
+  // Retry any failed Dad pushes from this run or previous runs.
+  // Durable, idempotent, never throws.
+  if (dadPushOn) {
+    try {
+      const { retryFailedDadPushes } = await import('./dad-push')
+      await retryFailedDadPushes(db, {
+        VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
+        VAPID_PRIVATE_KEY: env.VAPID_PRIVATE_KEY,
+        PUBLIC_BASE_URL: env.PUBLIC_BASE_URL,
+      })
+    } catch {
+      // Retry failures are audited; the tick result still reports discovery.
+    }
+  }
 
   return {
     ran: result.ran,
