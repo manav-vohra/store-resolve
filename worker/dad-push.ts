@@ -37,13 +37,25 @@ function webPush(env: DadPushEnv): WebPushProvider {
 export async function notifyDadNewComplaint(
   db: D1Database,
   env: DadPushEnv,
-  complaint: { id: string; externalCaseId: string; category?: string; storeNumber?: string },
+  complaint: {
+    id: string
+    externalCaseId: string
+    category?: string
+    storeNumber?: string
+    ingestionMode?: 'LIVE' | 'BACKFILL' | 'TEST'
+  },
 ): Promise<{ sent: boolean; reason?: string }> {
   const now = new Date().toISOString()
   try {
-    // Gate 1: FAMILY_PILOT only.
+    // Gate 0: LIVE complaints only. Historical BACKFILL imports must never
+    // trigger a "new complaint" push — Dad already knows about old mail.
+    if (complaint.ingestionMode !== 'LIVE')
+      return { sent: false, reason: 'NOT_LIVE_INGESTION' }
+
+    // Gate 1: FAMILY_PILOT only. The settings key is 'notification_mode'
+    // (see worker/d1.ts loadState); 'mode' does not exist.
     const mode = await db
-      .prepare(`SELECT value FROM settings WHERE key='mode'`)
+      .prepare(`SELECT value FROM settings WHERE key='notification_mode'`)
       .first<{ value: string }>()
     if (mode?.value !== 'FAMILY_PILOT') return { sent: false, reason: 'NOT_FAMILY_PILOT' }
 

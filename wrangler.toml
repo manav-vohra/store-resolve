@@ -15,9 +15,14 @@ EXTERNAL_NOTIFICATIONS_ENABLED = "false"
 VAPID_PUBLIC_KEY = "BEaf_RWjGAb19TP5EoFUiEU5Sautp58BH5RLzMSbZwApds4Ob9sudVD4WkOUhQD6pMugRNms93Sm9Zknt2cjCAk"
 
 # The operations tick is intentionally NOT scheduled. The legacy tick loads unbounded
-# application state per run; re-add a [triggers] block only together with the scoped tick.
+# application state per run.
+#
+# The Dad-only pilot tick (worker/dad-pilot-tick.ts) is implemented but NOT
+# enabled. To enable: uncomment the [triggers] block below AND set
+# email_ingestion_enabled='true' in D1 settings (separate safety flag).
+# Requires explicit owner approval — do not enable without it.
 # [triggers]
-# crons = ["*/5 * * * *"]
+# crons = ["*/15 * * * *"]
 
 [observability]
 enabled = true

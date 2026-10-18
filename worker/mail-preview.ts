@@ -329,6 +329,7 @@ export async function importSelectedPreviewMessages(
   window: PreviewWindow,
   messageIds: string[],
   ingestionMode: 'LIVE' | 'BACKFILL' = 'BACKFILL',
+  pushEnv?: { VAPID_PUBLIC_KEY?: string; VAPID_PRIVATE_KEY?: string; PUBLIC_BASE_URL?: string },
 ): Promise<{ results: PreviewImportResult[]; imported: number; failed: number }> {
   const windowCheck = validatePreviewWindow(window.receivedStart, window.receivedEnd)
   if (!windowCheck.ok) throw new Error(windowCheck.error)
@@ -372,11 +373,7 @@ export async function importSelectedPreviewMessages(
       const outcome = await ingestEmailMessage(db, full, {
         ingestionMode,
         allowOwnerSelectedReview: true,
-        pushEnv: {
-          VAPID_PUBLIC_KEY: c.env.VAPID_PUBLIC_KEY,
-          VAPID_PRIVATE_KEY: c.env.VAPID_PRIVATE_KEY,
-          PUBLIC_BASE_URL: c.env.PUBLIC_BASE_URL,
-        },
+        pushEnv,
       })
       if (outcome.status === 'FAILED_PARSING' || outcome.status === 'FAILED_PERSISTENCE') {
         results.push({ graphMessageId: id, maskedId: masked, status: outcome.status, errorCode: outcome.status })

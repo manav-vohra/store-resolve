@@ -59,7 +59,6 @@ import {
   sendResponseAction,
   submitResponseForApproval,
 } from './response-workflow'
-import { runScheduledOperations } from './operations'
 import { buildReport } from './reporting'
 
 type Bindings = Env & {
@@ -332,6 +331,7 @@ app.post('/api/complaints', zValidator('json', complaintInputSchema), async (c) 
         externalCaseId: result.complaint.externalCaseId,
         category: result.complaint.category,
         storeNumber: state.stores.find((s) => s.id === result.complaint.storeId)?.number,
+        ingestionMode: result.complaint.ingestionMode,
       },
     )
   } catch {
@@ -507,6 +507,11 @@ app.post('/api/admin/email/preview-import', async (c) => {
       { receivedStart: start, receivedEnd: end },
       parsed.data.messageIds,
       parsed.data.ingestionMode ?? 'BACKFILL',
+      {
+        VAPID_PUBLIC_KEY: c.env.VAPID_PUBLIC_KEY,
+        VAPID_PRIVATE_KEY: c.env.VAPID_PRIVATE_KEY,
+        PUBLIC_BASE_URL: c.env.PUBLIC_BASE_URL,
+      },
     )
     await auditAdminChange(c.env.DB, 'PREVIEW_IMPORT', 'email-preview-import', user.id)
     return c.json({ ok: true, ...result })
@@ -1610,6 +1615,10 @@ export default {
     _controller: { cron: string; scheduledTime: number },
     env: Bindings,
   ): Promise<void> {
-    await runScheduledOperations(env, emailProvider(env), provider(env), dispatchEligible)
+    // Dad-only pilot tick: scoped Graph discovery -> LIVE complaints ->
+    // Dad push. The legacy runScheduledOperations cron stays disabled;
+    // this tick no-ops unless emailIngestionEnabled is explicitly on.
+    const { runDadPilotDiscoveryTick } = await import('./dad-pilot-tick')
+    await runDadPilotDiscoveryTick(env as unknown as import('./dad-pilot-tick').DadPilotTickEnv)
   },
 }

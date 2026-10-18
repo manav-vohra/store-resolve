@@ -957,6 +957,13 @@ function ComplaintDetail({
   const manager = state.users.find((u) => u.id === c.assignedManagerId)
   const current = state.users.find((u) => u.id === state.activeUserId)!
   const isManager = current.id === c.assignedManagerId
+  // Mirror the backend FAMILY_PILOT OWNER exception (src/lib/workflow.ts
+  // updateComplaint): an OWNER/ADMIN may run the manager workflow on
+  // complaints with no assigned manager. Without this, Dad sees the case
+  // but gets no action buttons.
+  const isOwner = current.role === 'OWNER' || current.role === 'ADMIN'
+  const canActAsManager =
+    isManager || (isOwner && !c.assignedManagerId && state.config.mode === 'FAMILY_PILOT')
   const canClose =
     (current.role === 'OWNER' || current.role === 'ADMIN') && c.status === 'RESOLUTION_SUBMITTED'
   const [resolution, setResolution] = useState({
@@ -1042,7 +1049,7 @@ function ComplaintDetail({
               ))}
             </div>
           </section>
-          {isManager && c.status !== 'CLOSED' && (
+          {canActAsManager && c.status !== 'CLOSED' && (
             <section className="panel action-card">
               <div className="panel-head">
                 <div>

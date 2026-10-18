@@ -954,6 +954,7 @@ export async function ingestEmailMessage(
             externalCaseId: caseId,
             category: extraction.category,
             storeNumber: route.storeNumber ?? undefined,
+            ingestionMode,
           })
         } catch {
           // Push failures are audited inside notifyDadNewComplaint; ingestion continues.
