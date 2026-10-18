@@ -564,6 +564,12 @@ export interface IngestEmailMessageOptions {
   /** Skips the settings-table notification config load when a service is injected. */
   skipNotificationConfigLoad?: boolean
   /**
+   * VAPID env for Dad-only new-complaint push (Worker request context).
+   * When present, a push is sent to Dad on successful complaint creation.
+   * When absent (tests, non-request contexts), no push is attempted.
+   */
+  pushEnv?: { VAPID_PUBLIC_KEY?: string; VAPID_PRIVATE_KEY?: string; PUBLIC_BASE_URL?: string }
+  /**
    * Owner-selected import (preview flow) only. When true and the deterministic
    * gate says NOT a complaint, route to REVIEW_REQUIRED instead of IGNORED, so
    * a genuine forward/reply the gate missed is preserved for human review.
@@ -937,6 +943,22 @@ export async function ingestEmailMessage(
         },
       })
       await foundation.finishProcessing(lease, 'COMPLETED', now)
+      // Dad-only pilot: push Dad a notification for the new complaint.
+      // Fire-and-forget — never breaks ingestion. Only runs when the
+      // caller passes push env (Worker request context).
+      if (options.pushEnv) {
+        try {
+          const { notifyDadNewComplaint } = await import('./dad-push')
+          await notifyDadNewComplaint(db, options.pushEnv, {
+            id: result.complaint.id,
+            externalCaseId: caseId,
+            category: extraction.category,
+            storeNumber: route.storeNumber ?? undefined,
+          })
+        } catch {
+          // Push failures are audited inside notifyDadNewComplaint; ingestion continues.
+        }
+      }
       return { status, complaintId: result.complaint.id }
     }
 

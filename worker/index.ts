@@ -317,6 +317,26 @@ app.post('/api/complaints', zValidator('json', complaintInputSchema), async (c) 
   const result = createComplaint(state, c.req.valid('json'))
   await persistState(c.env.DB, result.state)
   await dispatchEligible(c.env, result.state)
+  // Dad-only pilot: push Dad for the new complaint. Never breaks the request.
+  try {
+    const { notifyDadNewComplaint } = await import('./dad-push')
+    await notifyDadNewComplaint(
+      c.env.DB,
+      {
+        VAPID_PUBLIC_KEY: c.env.VAPID_PUBLIC_KEY,
+        VAPID_PRIVATE_KEY: c.env.VAPID_PRIVATE_KEY,
+        PUBLIC_BASE_URL: c.env.PUBLIC_BASE_URL,
+      },
+      {
+        id: result.complaint.id,
+        externalCaseId: result.complaint.externalCaseId,
+        category: result.complaint.category,
+        storeNumber: state.stores.find((s) => s.id === result.complaint.storeId)?.number,
+      },
+    )
+  } catch {
+    // Audited inside notifyDadNewComplaint; request continues.
+  }
   return c.json(publicState(await loadState(c.env.DB), user))
 })
 app.post('/api/complaints/:id/actions', zValidator('json', actionSchema), async (c) => {

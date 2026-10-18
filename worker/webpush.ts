@@ -283,6 +283,22 @@ export function buildTestPushPayload(badgeCount: number): WebPushPayload {
   }
 }
 
+export function buildNewComplaintPushPayload(complaint: {
+  id: string
+  externalCaseId: string
+  category?: string
+  storeNumber?: string
+}): WebPushPayload {
+  const where = complaint.storeNumber ? ` — store #${complaint.storeNumber}` : ''
+  const what = complaint.category ? `: ${complaint.category}` : ''
+  return {
+    title: 'New Dunkin complaint',
+    body: `${complaint.externalCaseId}${what}${where} — tap to open in StoreResolve.`,
+    url: `/#/complaints/${complaint.id}`,
+    tag: `new-complaint-${complaint.id}`,
+  }
+}
+
 /**
  * Send one encrypted push message. Throws on transport/provider errors.
  * A 404/410 resolves to `{expired: true}` instead of throwing so the caller

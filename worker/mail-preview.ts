@@ -372,6 +372,11 @@ export async function importSelectedPreviewMessages(
       const outcome = await ingestEmailMessage(db, full, {
         ingestionMode,
         allowOwnerSelectedReview: true,
+        pushEnv: {
+          VAPID_PUBLIC_KEY: c.env.VAPID_PUBLIC_KEY,
+          VAPID_PRIVATE_KEY: c.env.VAPID_PRIVATE_KEY,
+          PUBLIC_BASE_URL: c.env.PUBLIC_BASE_URL,
+        },
       })
       if (outcome.status === 'FAILED_PARSING' || outcome.status === 'FAILED_PERSISTENCE') {
         results.push({ graphMessageId: id, maskedId: masked, status: outcome.status, errorCode: outcome.status })
