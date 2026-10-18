@@ -115,8 +115,15 @@ export async function notifyDadNewComplaint(
       await record(db, complaint.id, 'SENT', null, now)
       return { sent: true }
     } catch (error) {
-      await record(db, complaint.id, 'FAILED', (error as Error).message.slice(0, 500), now)
-      return { sent: false, reason: 'SEND_FAILED' }
+      const msg = (error as Error).message
+      // Distinguish definite failures from uncertain outcomes.
+      // Uncertain (timeout/5xx/network after submit): the push may have
+      // been accepted. Record as NEEDS_RECONCILIATION — never auto-retry,
+      // a human verifies before any resend to avoid double-notifying Dad.
+      const uncertain = /timeout|timed out|5\d\d|network|econn|socket|abort/i.test(msg)
+      const status = uncertain ? 'NEEDS_RECONCILIATION' : 'FAILED'
+      await record(db, complaint.id, status, msg.slice(0, 500), now)
+      return { sent: false, reason: uncertain ? 'SEND_UNCERTAIN' : 'SEND_FAILED' }
     }
   } catch (error) {
     // Never break the caller. Record the failure if we can, then swallow.
@@ -132,7 +139,7 @@ export async function notifyDadNewComplaint(
 async function record(
   db: D1Database,
   complaintId: string,
-  status: 'SENT' | 'FAILED' | 'SKIPPED',
+  status: 'SENT' | 'FAILED' | 'SKIPPED' | 'NEEDS_RECONCILIATION',
   reason: string | null,
   now: string,
 ): Promise<void> {
@@ -193,7 +200,8 @@ async function record(
  * display is confirmed only by the recipient.
  */
 const MAX_RETRY_ATTEMPTS = 3
-const RETRY_BACKOFF_MS = [5 * 60_1000, 30 * 60_1000, 2 * 60 * 60_1000]
+/** Exported for tests: must be exactly [300_000, 1_800_000, 7_200_000]. */
+export const RETRY_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000]
 
 export async function retryFailedDadPushes(
   db: D1Database,

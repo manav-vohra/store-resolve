@@ -103,6 +103,14 @@ export interface MailboxDiscoveryOptions {
   /** Optional receivedDateTime window for the initial delta (bounds historical mail). */
   receivedStart?: string
   receivedEnd?: string
+  /**
+   * Initial-sync boundary marker. When set, page checkpoints store
+   * `BOUNDARY:{boundary}` in high_water_received_at so the caller can
+   * re-apply the historical-mail cutoff on subsequent ticks until the
+   * first deltaLink arrives. Cleared automatically when the deltaLink
+   * (initial sync complete) is persisted.
+   */
+  initialSyncBoundary?: string
   /** Defaults to the real intake path. Tests inject a spy. */
   ingest?: (
     db: D1Database,
@@ -246,6 +254,10 @@ export async function runMailboxDiscovery(
   }
 
   try {
+    // Tracks whether any page so far had failures. A later page's checkpoint
+    // must never advance past an earlier failed page — failed messages stay
+    // recoverable via the previous cursor.
+    let runHadFailures = false
     for (let page = 0; page < maxPages; page += 1) {
       let delta: InboxDeltaPage
       // Per-page failure count for checkpoint decisions. A page is only
@@ -348,12 +360,20 @@ export async function runMailboxDiscovery(
       // Page-level checkpoint: after a fully processed page (zero failures),
       // persist the nextLink so the next run resumes from the next page
       // instead of replaying this one. Never checkpoint a partially
-      // processed or failed page — those must be re-processed from the
-      // previous cursor.
-      if (pageFailures === 0 && delta.nextLink && !delta.deltaLink) {
+      // processed or failed page, and never checkpoint past an earlier
+      // failed page in the same run — failed messages stay recoverable
+      // via the previous cursor.
+      if (pageFailures > 0) runHadFailures = true
+      if (pageFailures === 0 && !runHadFailures && delta.nextLink && !delta.deltaLink) {
+        // During initial sync, preserve the boundary marker so the next tick
+        // re-applies the historical-mail cutoff. The marker is cleared when
+        // the deltaLink (sync complete) is written.
+        const hw = options.initialSyncBoundary
+          ? `BOUNDARY:${options.initialSyncBoundary}`
+          : highWater
         await writeCursor(db, provider, mailboxKey, scope, {
           cursorValue: delta.nextLink,
-          highWaterReceivedAt: highWater,
+          highWaterReceivedAt: hw,
         })
         result.cursorUpdated = true
       }

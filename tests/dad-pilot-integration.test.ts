@@ -290,3 +290,49 @@ describe('dad push payload privacy', () => {
     expect(text.toLowerCase()).not.toContain('customer')
   })
 })
+
+describe('retry backoff delays', () => {
+  it('uses exact millisecond delays: 5min, 30min, 2h', async () => {
+    // Regression: 60_1000 is 60,1000 (sixty thousand one hundred), not 60,000.
+    // The backoff must be exactly 300_000, 1_800_000, 7_200_000 ms.
+    const { RETRY_BACKOFF_MS } = await import('../worker/dad-push')
+    // Access via a test export or verify through behavior.
+    // We verify the constants are correct by importing the module
+    // and checking the exported values (added for testability).
+    expect(RETRY_BACKOFF_MS).toEqual([300_000, 1_800_000, 7_200_000])
+  })
+})
+describe('failed page recovery', () => {
+  it('page 1 fails, page 2 succeeds: checkpoint never advances past the failure', async () => {
+    // Page 1 has a message that fails ingest. Page 2 completes cleanly.
+    // The page-2 checkpoint must NOT advance past page 1's failure —
+    // the failed message stays recoverable via the previous cursor.
+    const client = new FakeDeltaDiscoveryClient([
+      { messages: [dunkinMessage('fail-1', 'CCC00000001')], nextLink: 'next-1' },
+      { messages: [dunkinMessage('ok-1', 'CCC00000002')], nextLink: 'next-2' },
+    ])
+    const db = makeFakeDb()
+    const seen: string[] = []
+    const result = await runMailboxDiscovery(db, {
+      provider: 'MICROSOFT_GRAPH',
+      mailboxKey: 'production',
+      scope: DISCOVERY_SCOPE_INBOX_DELTA,
+      ingestionEnabled: true,
+      client,
+      maxPages: 5,
+      ingest: async (_db, message) => {
+        seen.push(message.id)
+        if (message.id === 'fail-1') throw new Error('simulated ingest failure')
+        return { status: 'PROCESSED', complaintId: `c-${message.id}` }
+      },
+    })
+    // Both messages were attempted.
+    expect(seen).toEqual(['fail-1', 'ok-1'])
+    expect(result.failures).toBe(1)
+    expect(result.failedIds).toContain('fail-1')
+    // No checkpoint was written past the failure: cursorUpdated is false
+    // because page 2's checkpoint was suppressed (runHadFailures).
+    // The next run replays from the previous cursor, recovering fail-1.
+    expect(result.cursorUpdated).toBe(false)
+  })
+})

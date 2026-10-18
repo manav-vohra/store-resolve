@@ -119,11 +119,18 @@ export async function runDadPilotDiscoveryTick(
   // approved activation boundary (settings key 'discovery_activation_boundary',
   // ISO timestamp). Without it, refuse — never ingest historical mail as LIVE
   // on a guess. The owner sets this once before activation.
-  const cursor = await db
-    .prepare(`SELECT cursor_value FROM mail_discovery_cursors WHERE provider=? AND mailbox_key=? AND scope=?`)
+  //
+  // The boundary is preserved through the entire initial sync: it is stored
+  // alongside the cursor and re-applied on every tick until the first
+  // deltaLink arrives (initial sync complete). A page checkpoint must never
+  // accidentally drop the historical-mail cutoff.
+  const cursorRow = await db
+    .prepare(
+      `SELECT cursor_value, high_water_received_at FROM mail_discovery_cursors WHERE provider=? AND mailbox_key=? AND scope=?`,
+    )
     .bind('MICROSOFT_GRAPH', TICK_MAILBOX_KEY, DISCOVERY_SCOPE_INBOX_DELTA)
-    .first<{ cursor_value: string | null }>()
-  const hasCursor = Boolean(cursor?.cursor_value)
+    .first<{ cursor_value: string | null; high_water_received_at: string | null }>()
+  const hasCursor = Boolean(cursorRow?.cursor_value)
   let receivedStart: string | undefined
   if (!hasCursor) {
     const boundary = await db
@@ -133,6 +140,16 @@ export async function runDadPilotDiscoveryTick(
     if (!Number.isFinite(boundaryMs))
       return { ...empty, reason: 'NEEDS_ACTIVATION_BOUNDARY' }
     receivedStart = new Date(boundaryMs).toISOString()
+  } else {
+    // If the stored cursor is a page checkpoint (not a deltaLink) from the
+    // initial sync, the boundary still applies. We detect this via a marker:
+    // the boundary is stored in high_water_received_at with a prefix.
+    // (Delta cursors from Graph are opaque URLs; page nextLinks are too.
+    // The marker distinguishes "initial sync in progress".)
+    const hw = cursorRow?.high_water_received_at ?? ''
+    if (hw.startsWith('BOUNDARY:')) {
+      receivedStart = hw.slice('BOUNDARY:'.length)
+    }
   }
 
   let messagesSeen = 0
@@ -144,6 +161,8 @@ export async function runDadPilotDiscoveryTick(
     client: new GraphDeltaDiscoveryClient(provider),
     maxPages: TICK_MAX_PAGES,
     receivedStart,
+    // Preserve the boundary through the initial sync (see Gate 5).
+    initialSyncBoundary: receivedStart,
     ingest: async (database, message) => {
       // Genuine processing budget: count every message handed to ingest
       // (including duplicates). On exhaustion, throw to stop the loop
