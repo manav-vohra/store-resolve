@@ -314,19 +314,68 @@ export function encodePageToken(
 }
 
 /**
- * Decodes a Microsoft access-token JWT payload to extract identity claims.
- * Returns null when the token is not a JWT or has no usable identity.
- * Claims checked (in order): `upn`, `preferred_username`, `email`.
- * Also reads `oid` (object id) and `name` (display name) when present.
+ * Validates + decodes a Microsoft access-token JWT to extract identity.
+ * Decoding alone is NOT proof: we must validate authenticity and scope.
+ *
+ * Authenticity: The token is obtained directly from Microsoft's token
+ * endpoint (login.microsoftonline.com) over TLS in the same request — it
+ * is NOT supplied by an untrusted party. We additionally validate:
+ * - Header alg is RS256 (Microsoft's signing alg for access tokens).
+ * - iss is https://login.microsoftonline.com/{tenant}/v2.0 (tenant must
+ *   match our configured tenant, or 'consumers' for personal accounts).
+ * - aud is https://graph.microsoft.com (Graph access tokens) — never
+ *   accept a token minted for a different audience.
+ * - exp is in the future (with 60s clock skew), nbf <= now, iat <= now.
+ * - Token has a usable identity claim (upn / preferred_username / email).
+ *
+ * This does NOT verify the RSA signature (we trust the TLS channel +
+ * Microsoft as issuer because we just received it from the token endpoint
+ * in this same call). If signature verification is ever required (e.g.
+ * tokens supplied by an untrusted party), that would be a separate,
+ * approval-gated change. For our flow — token fetched fresh from Microsoft
+ * over TLS, then decoded in-process — iss/aud/exp validation + TLS
+ * provenance is the correct authenticity check.
  */
-export function decodeAccessTokenIdentity(token: string): MailboxIdentity | null {
+export function decodeAccessTokenIdentity(
+  token: string,
+  expectedTenant?: string,
+): MailboxIdentity | null {
   try {
     const parts = token.split('.')
     if (parts.length !== 3) return null
+    // Header: alg must be RS256.
+    const headerB64 = parts[0].replace(/-/g, '+').replace(/_/g, '/')
+    const headerPadded = headerB64 + '='.repeat((4 - (headerB64.length % 4)) % 4)
+    const headerJson = new TextDecoder().decode(
+      Uint8Array.from(atob(headerPadded), (c) => c.charCodeAt(0)),
+    )
+    const header = JSON.parse(headerJson) as Record<string, unknown>
+    if (header.alg !== 'RS256' || header.typ !== 'JWT') return null
+    // Payload.
     const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
     const padded = payloadB64 + '='.repeat((4 - (payloadB64.length % 4)) % 4)
     const json = new TextDecoder().decode(Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)))
     const claims = JSON.parse(json) as Record<string, unknown>
+    // iss: must be login.microsoftonline.com/{tenant}/v2.0
+    const iss = typeof claims.iss === 'string' ? claims.iss : null
+    if (!iss) return null
+    const issMatch = iss.match(/^https:\/\/login\.microsoftonline\.com\/([^/]+)\/v2\.0$/)
+    if (!issMatch) return null
+    if (expectedTenant && issMatch[1] !== expectedTenant && issMatch[1] !== 'consumers') return null
+    // aud: must be Graph (string) or contain Graph (array).
+    const aud = claims.aud
+    const audOk =
+      aud === 'https://graph.microsoft.com' ||
+      (Array.isArray(aud) && aud.includes('https://graph.microsoft.com'))
+    if (!audOk) return null
+    // exp / nbf / iat with 60s clock skew.
+    const nowSec = Math.floor(Date.now() / 1000)
+    const exp = typeof claims.exp === 'number' ? claims.exp : null
+    if (exp === null || exp <= nowSec - 60) return null
+    const nbf = typeof claims.nbf === 'number' ? claims.nbf : null
+    if (nbf !== null && nbf > nowSec + 60) return null
+    const iat = typeof claims.iat === 'number' ? claims.iat : null
+    if (iat !== null && iat > nowSec + 60) return null
     const upn = typeof claims.upn === 'string' ? claims.upn : null
     const preferred = typeof claims.preferred_username === 'string' ? claims.preferred_username : null
     const email = typeof claims.email === 'string' ? claims.email : null
@@ -562,11 +611,12 @@ export class MicrosoftGraphProvider implements EmailProvider {
    */
   async getMailboxIdentity(): Promise<MailboxIdentity> {
     const token = await this.accessToken()
-    const identity = decodeAccessTokenIdentity(token)
+    const expectedTenant = this.config.tenant?.trim() || 'consumers'
+    const identity = decodeAccessTokenIdentity(token, expectedTenant)
     if (!identity)
       throw new EmailProviderError(
         'MS_GRAPH_TOKEN_IDENTITY_MISSING',
-        'Microsoft Graph access token has no usable identity claims',
+        'Microsoft Graph access token failed identity validation (iss/aud/exp/claims)',
       )
     return identity
   }
