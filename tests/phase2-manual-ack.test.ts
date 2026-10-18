@@ -168,7 +168,7 @@ describe('Phase 2 manual ack', () => {
     expect(second).toBe('ALREADY_HANDLED')
   })
 
-  it('stale IN_FLIGHT can be reclaimed to PENDING (not sent) then retried', async () => {
+  it('stale IN_FLIGHT with sentConfirmed=false stays in reconciliation (no auto-reset)', async () => {
     await seedComplaint()
     const ambiguous = fakeProvider({
       sendImpl: async () => { throw new EmailProviderError('MS_GRAPH_API_ERROR', 'server error', 500) },
@@ -176,7 +176,26 @@ describe('Phase 2 manual ack', () => {
     await acknowledgeComplaint(db, ambiguous, 'c1', baseConfig(true))
     const old = new Date(Date.now() - 20 * 60_000).toISOString()
     await db.prepare(`UPDATE email_acknowledgments SET updated_at=? WHERE complaint_id='c1'`).bind(old).run()
-    const toPending = await reclaimStaleAck(db, 'c1', { checkedSentItems: true, sentConfirmed: false })
+    const result = await reclaimStaleAck(db, 'c1', { checkedSentItems: true, sentConfirmed: false })
+    expect(result).toBe('NEEDS_FURTHER_RECONCILIATION')
+    const row = await db.prepare(`SELECT status FROM email_acknowledgments WHERE complaint_id='c1'`).first<{ status: string }>()
+    expect(row?.status).toBe('IN_FLIGHT')
+  })
+
+  it('stale IN_FLIGHT forceReset with note resets to PENDING (audited override)', async () => {
+    await seedComplaint()
+    const ambiguous = fakeProvider({
+      sendImpl: async () => { throw new EmailProviderError('MS_GRAPH_API_ERROR', 'server error', 500) },
+    })
+    await acknowledgeComplaint(db, ambiguous, 'c1', baseConfig(true))
+    const old = new Date(Date.now() - 20 * 60_000).toISOString()
+    await db.prepare(`UPDATE email_acknowledgments SET updated_at=? WHERE complaint_id='c1'`).bind(old).run()
+    const toPending = await reclaimStaleAck(db, 'c1', {
+      checkedSentItems: true,
+      sentConfirmed: false,
+      forceReset: true,
+      reconciliationNote: 'Checked Sent Items, thread, and waited 24h — no reply found. Conclusive.',
+    })
     expect(toPending).toBe('RECLAIMED_TO_PENDING')
     const retry = await acknowledgeComplaint(db, fakeProvider(), 'c1', baseConfig(false), {
       manual: true,
@@ -184,6 +203,17 @@ describe('Phase 2 manual ack', () => {
       mailboxIdentityVerified: true,
     })
     expect(retry).toBe('SENT')
+  })
+
+  it('ack refuses wrong recipient (forward from family member, not Dunkin)', async () => {
+    const now = new Date().toISOString()
+    await db.prepare(`INSERT INTO complaints (id, external_case_id, store_id, source, subject, complaint_text, category, severity, status, acknowledgement_status, routing_reason, routing_confidence, received_at, ack_deadline, created_at, updated_at) VALUES ('c3','CCC3','store-1','MICROSOFT_GRAPH','Test','Test','SERVICE','LOW','ROUTING_REVIEW','DISABLED','test','HIGH',?,?,?,?)`).bind(now, now, now, now).run()
+    await db.prepare(`INSERT INTO gmail_messages (gmail_message_id, complaint_id, gmail_thread_id, sender, recipients, subject, internal_date, is_follow_up, acknowledgment_status, processing_status, first_seen_at, updated_at) VALUES ('gm3','c3','th3','Dad <ajvohra1@yahoo.com>','ops@example.invalid','Fwd: DBI Case # CCC3',?,0,'DISABLED','PROCESSED',?,?)`).bind(now, now, now).run()
+    const result = await acknowledgeComplaint(db, fakeProvider(), 'c3', baseConfig(false), {
+      manual: true,
+      mailboxIdentityVerified: true,
+    })
+    expect(result).toBe('WRONG_RECIPIENT')
   })
 
   it('reclaim refuses without Sent Items check', async () => {

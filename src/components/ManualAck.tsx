@@ -84,7 +84,14 @@ export function ManualAck({
       setError(`Reclaim result: ${res.result}. Refresh the page to see updated status.`)
       setShowReclaim(false)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Reclaim failed')
+      const msg = e instanceof Error ? e.message : 'Reclaim failed'
+      // Absence from Sent Items alone is NOT conclusive — the ack stays
+      // IN_FLIGHT pending further reconciliation. Do not auto-retry.
+      if (msg.includes('NEEDS_FURTHER_RECONCILIATION')) {
+        setError('Not in Sent Items alone is not conclusive proof it was not sent. The ack stays in pending-reconciliation (IN_FLIGHT). Check the thread, wait, and re-check before any force-reset with a written note.')
+      } else {
+        setError(msg)
+      }
     } finally {
       setLoading(false)
     }

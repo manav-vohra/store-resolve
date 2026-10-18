@@ -92,12 +92,19 @@ describe('listInboxPreviewPage', () => {
     expect(fetched.some((u) => u.includes('/me/mailFolders/inbox/messages'))).toBe(true)
     expect(fetched.some((u) => u.includes('/me/messages?'))).toBe(false)
     fetched.length = 0
-    // Page 2: pageToken must rebuild Inbox URL, not fetch the token as a URL
-    await provider.listInboxPreviewPage({
+    // Page 2: opaque pageToken must rebuild Inbox URL, not fetch the token as a URL
+    const { encodePageToken } = await import('../worker/microsoft-graph')
+    const window = {
       receivedStart: '2026-10-10T00:00:00.000Z',
       receivedEnd: '2026-10-17T23:59:59.999Z',
+    }
+    const filter = `receivedDateTime ge ${window.receivedStart} and receivedDateTime lt ${window.receivedEnd}`
+    const nextLink = `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?${new URLSearchParams({ $filter: filter, $orderby: 'receivedDateTime desc', $top: '50', $skiptoken: 'skip-abc' }).toString()}`
+    const token = encodePageToken(nextLink, window)
+    await provider.listInboxPreviewPage({
+      ...window,
       top: 50,
-      pageToken: 'skip-abc',
+      pageToken: token ?? undefined,
     })
     const graphFetch = fetched.find((u) => u.includes('graph.microsoft.com'))
     expect(graphFetch).toContain('/me/mailFolders/inbox/messages')
@@ -105,8 +112,14 @@ describe('listInboxPreviewPage', () => {
     expect(graphFetch).not.toContain('evil')
   })
 
-  it('returns nextPageToken (skiptoken) only, not a full Graph URL', async () => {
+  it('returns nextPageToken (opaque) only, not a full Graph URL', async () => {
     const provider = new MicrosoftGraphProvider({ clientId: 'c', refreshToken: 'r', mailboxAddress: 'm' })
+    const window = {
+      receivedStart: '2026-10-10T00:00:00.000Z',
+      receivedEnd: '2026-10-17T23:59:59.999Z',
+    }
+    const filter = `receivedDateTime ge ${window.receivedStart} and receivedDateTime lt ${window.receivedEnd}`
+    const nextLink = `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?${new URLSearchParams({ $filter: filter, $orderby: 'receivedDateTime desc', $top: '50', $skiptoken: 'tok123' }).toString()}`
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url: string) => {
@@ -118,17 +131,17 @@ describe('listInboxPreviewPage', () => {
           status: 200,
           json: async () => ({
             value: [],
-            '@odata.nextLink':
-              'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=tok123',
+            '@odata.nextLink': nextLink,
           }),
         } as unknown as Response
       }),
     )
-    const result = await provider.listInboxPreviewPage({
-      receivedStart: '2026-10-10T00:00:00.000Z',
-      receivedEnd: '2026-10-17T23:59:59.999Z',
-    })
-    expect(result.nextPageToken).toBe('tok123')
+    const result = await provider.listInboxPreviewPage(window)
+    expect(result.nextPageToken).toBeTruthy()
+    expect(result.nextPageToken).not.toContain('graph.microsoft.com')
+    // Opaque token decodes to the original skiptoken
+    const { decodePageToken } = await import('../worker/microsoft-graph')
+    expect(decodePageToken(result.nextPageToken!).skiptoken).toBe('tok123')
   })
 })
 

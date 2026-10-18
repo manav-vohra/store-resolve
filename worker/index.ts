@@ -353,7 +353,7 @@ app.get('/api/admin/email/readiness', async (c) => {
 })
 
 // Phase 1 — Check Mail Now preview. Read-only: no complaints, no cursor, no sends, no D1 writes.
-// Owner-only. Accepts ?start= &end= ISO, ?top= (1..100), ?pageToken= (opaque $skiptoken).
+// Owner-only. Accepts ?start= &end= ISO, ?top= (1..100), ?pageToken= (opaque continuation: $skip and/or $skiptoken).
 // Rejects ?nextLink= : browser-provided Graph URLs are never fetched. The
 // server rebuilds the Inbox URL from pageToken + window.
 app.get('/api/admin/email/preview', async (c) => {
@@ -605,7 +605,12 @@ app.post('/api/complaints/:id/acknowledge/reclaim', async (c) => {
     return c.json(jsonError('Invalid JSON'), 400)
   }
   const parsed = z
-    .object({ checkedSentItems: z.literal(true), sentConfirmed: z.boolean() })
+    .object({
+      checkedSentItems: z.literal(true),
+      sentConfirmed: z.boolean(),
+      forceReset: z.boolean().optional(),
+      reconciliationNote: z.string().max(1000).optional(),
+    })
     .safeParse(body)
   if (!parsed.success)
     return c.json(jsonError('checkedSentItems: true and sentConfirmed (boolean) required'), 400)

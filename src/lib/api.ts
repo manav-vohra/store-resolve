@@ -215,7 +215,7 @@ export const api = {
       z.object({ ok: z.boolean(), result: z.string() }),
       { method: 'POST', body: JSON.stringify({ confirmed: true }) },
     ),
-  ackReclaim: (complaintId: string, body: { checkedSentItems: true; sentConfirmed: boolean }) =>
+  ackReclaim: (complaintId: string, body: { checkedSentItems: true; sentConfirmed: boolean; forceReset?: boolean; reconciliationNote?: string }) =>
     request(
       `/complaints/${encodeURIComponent(complaintId)}/acknowledge/reclaim`,
       z.object({ ok: z.boolean(), result: z.string() }),

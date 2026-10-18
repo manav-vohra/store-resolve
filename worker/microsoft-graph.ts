@@ -202,6 +202,188 @@ export function extractSkiptoken(nextLink: string): string | null {
   }
 }
 
+/**
+ * Opaque pagination continuation for Inbox preview.
+ *
+ * Microsoft Graph message-list @odata.nextLink uses $skip (e.g.
+ * .../messages?$skip=10&$top=10...), NOT $skiptoken. The previous code
+ * only read $skiptoken, so every $skip nextLink was dropped and preview
+ * returned nextPageToken=null even when more pages existed — the
+ * Oct 10-17 top=10 truncation bug.
+ *
+ * Safe handling: We NEVER accept a browser-provided Graph URL. The server
+ * validates the Graph-generated nextLink (must be the approved Inbox
+ * endpoint, same $filter window, same $orderby, same $select), extracts
+ * ONLY the paging state ($skip and/or $skiptoken + $top), and encodes it
+ * as an opaque base64url token. Callers pass that token back; the server
+ * decodes it, re-validates it, and rebuilds the Inbox URL with the same
+ * window + preserved paging state. The complete Microsoft paging state is
+ * preserved (skip offset + skiptoken + original top), while host/path/
+ * filter/scope cannot be widened by a caller.
+ */
+export interface PageContinuation {
+  skip?: number
+  skiptoken?: string
+  top?: number
+}
+
+const MAX_PAGE_TOKEN_BYTES = 4096
+const MAX_SKIP = 1_000_000
+
+function base64UrlEncode(data: string): string {
+  const bytes = new TextEncoder().encode(data)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i])
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+}
+
+function base64UrlDecode(token: string): string | null {
+  try {
+    const padded = token.replace(/-/g, '+').replace(/_/g, '/')
+    const paddedWithEquals = padded + '='.repeat((4 - (padded.length % 4)) % 4)
+    return new TextDecoder().decode(
+      Uint8Array.from(atob(paddedWithEquals), (c) => c.charCodeAt(0)),
+    )
+  } catch {
+    return null
+  }
+}
+
+/** Validates a Graph nextLink and encodes its paging state as an opaque token. */
+export function encodePageToken(
+  nextLink: string,
+  expectedWindow: { receivedStart: string; receivedEnd: string },
+): string | null {
+  let url: URL
+  try {
+    url = new URL(nextLink)
+  } catch {
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is malformed')
+  }
+  // Must be the approved Inbox endpoint only — never /me/messages, never Sent Items, never other hosts.
+  if (url.protocol !== 'https:' || url.hostname !== 'graph.microsoft.com')
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink host is not trusted')
+  if (url.pathname !== '/v1.0/me/mailFolders/inbox/messages')
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink must target Inbox messages')
+  if (url.username || url.password || url.hash || (url.port !== '' && url.port !== '443'))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink is invalid')
+  if (url.pathname.includes('..') || url.pathname.includes('\\'))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink path is invalid')
+  // $filter must match the original window — pagination must not widen scope.
+  // Normalize whitespace: Graph may URL-encode or re-space the filter.
+  const normalizeFilter = (s: string) => s.replace(/\s+/g, ' ').trim()
+  const filter = url.searchParams.get('$filter')
+  const expectedFilter = `receivedDateTime ge ${expectedWindow.receivedStart} and receivedDateTime lt ${expectedWindow.receivedEnd}`
+  if (!filter || normalizeFilter(filter) !== normalizeFilter(expectedFilter))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink filter does not match original window')
+  // $orderby must be the same (receivedDateTime desc) — no reordering.
+  const orderby = url.searchParams.get('$orderby')
+  if (!orderby || orderby.replace(/\s+/g, ' ').trim() !== 'receivedDateTime desc')
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink orderby does not match')
+  // Paging state: $skip (integer) and/or $skiptoken (opaque). At least one must be present.
+  const skipRaw = url.searchParams.get('$skip')
+  const skiptoken = url.searchParams.get('$skiptoken')
+  const topRaw = url.searchParams.get('$top')
+  let skip: number | undefined
+  if (skipRaw !== null) {
+    if (!/^\d+$/.test(skipRaw)) throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink $skip is invalid')
+    skip = parseInt(skipRaw, 10)
+    if (skip < 0 || skip > MAX_SKIP) throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink $skip out of range')
+  }
+  if (skiptoken !== null && (skiptoken.length === 0 || skiptoken.length > 4096 || /[\r\n]/.test(skiptoken)))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink $skiptoken is invalid')
+  if (skip === undefined && !skiptoken)
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink has no paging state')
+  let top: number | undefined
+  if (topRaw !== null) {
+    if (!/^\d+$/.test(topRaw)) throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink $top is invalid')
+    top = parseInt(topRaw, 10)
+    if (top < 1 || top > 100) throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph nextLink $top out of range')
+  }
+  const continuation: PageContinuation = {}
+  if (skip !== undefined) continuation.skip = skip
+  if (skiptoken) continuation.skiptoken = skiptoken
+  if (top !== undefined) continuation.top = top
+  const token = base64UrlEncode(JSON.stringify(continuation))
+  if (token.length > MAX_PAGE_TOKEN_BYTES)
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Graph page token too large')
+  return token
+}
+
+/**
+ * Decodes a Microsoft access-token JWT payload to extract identity claims.
+ * Returns null when the token is not a JWT or has no usable identity.
+ * Claims checked (in order): `upn`, `preferred_username`, `email`.
+ * Also reads `oid` (object id) and `name` (display name) when present.
+ */
+export function decodeAccessTokenIdentity(token: string): MailboxIdentity | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = payloadB64 + '='.repeat((4 - (payloadB64.length % 4)) % 4)
+    const json = new TextDecoder().decode(Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)))
+    const claims = JSON.parse(json) as Record<string, unknown>
+    const upn = typeof claims.upn === 'string' ? claims.upn : null
+    const preferred = typeof claims.preferred_username === 'string' ? claims.preferred_username : null
+    const email = typeof claims.email === 'string' ? claims.email : null
+    const oid = typeof claims.oid === 'string' ? claims.oid : null
+    const name = typeof claims.name === 'string' ? claims.name : null
+    const principal = upn ?? preferred ?? email
+    if (!principal) return null
+    return {
+      id: oid ?? principal,
+      displayName: name ?? principal,
+      mail: email ?? upn ?? preferred,
+      userPrincipalName: upn ?? preferred ?? email,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Decodes and validates an opaque page token issued by encodePageToken. */
+export function decodePageToken(token: string): PageContinuation {
+  if (!token || token.length > MAX_PAGE_TOKEN_BYTES || /[\r\n]/.test(token) || /[^A-Za-z0-9_-]/.test(token))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+  const json = base64UrlDecode(token)
+  if (!json) throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(json)
+  } catch {
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+  const obj = parsed as Record<string, unknown>
+  const keys = Object.keys(obj)
+  if (keys.length === 0 || keys.some((k) => !['skip', 'skiptoken', 'top'].includes(k)))
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
+  const result: PageContinuation = {}
+  if ('skip' in obj) {
+    if (typeof obj.skip !== 'number' || !Number.isInteger(obj.skip) || obj.skip < 0 || obj.skip > MAX_SKIP)
+      throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token $skip is invalid')
+    result.skip = obj.skip
+  }
+  if ('skiptoken' in obj) {
+    if (typeof obj.skiptoken !== 'string' || obj.skiptoken.length === 0 || obj.skiptoken.length > 4096 || /[\r\n]/.test(obj.skiptoken))
+      throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token $skiptoken is invalid')
+    result.skiptoken = obj.skiptoken
+  }
+  if ('top' in obj) {
+    if (typeof obj.top !== 'number' || !Number.isInteger(obj.top) || obj.top < 1 || obj.top > 100)
+      throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token $top is invalid')
+    result.top = obj.top
+  }
+  if (result.skip === undefined && !result.skiptoken)
+    throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token has no paging state')
+  return result
+}
+
 const htmlToText = (value: string) =>
   value
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -362,30 +544,31 @@ export class MicrosoftGraphProvider implements EmailProvider {
   }
 
   /**
-   * Phase 2 — Mailbox identity proof. Returns the Graph /me identity for
-   * the authorized token: id, displayName, mail, userPrincipalName.
-   * This is stronger than Inbox folder metadata (which only proves a
-   * mailbox is reachable, not whose mailbox it is). Manual ack requires
-   * this identity to match the expected complaint mailbox (MS_MAILBOX_ADDRESS).
+   * Phase 2 — Mailbox identity proof, WITHOUT requiring User.Read.
+   *
+   * GET /me normally needs User.Read, which our existing delegated scopes
+   * (offline_access, Mail.Read, Mail.Send) do NOT include. We have hit
+   * this 403 before. Instead, decode the Microsoft-issued access token
+   * JWT itself: its `upn` / `preferred_username` / `email` claims are the
+   * authorized mailbox identity, no extra Graph call or permission needed.
+   * This is compatible with the existing verified OAuth setup — no scope
+   * change, no re-consent. If the token has no usable identity claims,
+   * return a clear failure (TOKEN_IDENTITY_MISSING) and refuse to send.
+   *
+   * The token is obtained from Microsoft via refresh flow; we decode only
+   * its payload (no signature verification — we trust Microsoft as the
+   * issuer because we just received it from login.microsoftonline.com).
+   * Never log the token or its claims beyond the masked identity.
    */
   async getMailboxIdentity(): Promise<MailboxIdentity> {
-    const me = await this.request<{
-      id?: string
-      displayName?: string
-      mail?: string | null
-      userPrincipalName?: string | null
-    }>('/me?$select=id,displayName,mail,userPrincipalName')
-    if (!me.id || !me.displayName)
+    const token = await this.accessToken()
+    const identity = decodeAccessTokenIdentity(token)
+    if (!identity)
       throw new EmailProviderError(
-        'MS_GRAPH_INVALID_MAILBOX_IDENTITY',
-        'Microsoft Graph /me identity is incomplete',
+        'MS_GRAPH_TOKEN_IDENTITY_MISSING',
+        'Microsoft Graph access token has no usable identity claims',
       )
-    return {
-      id: me.id,
-      displayName: me.displayName,
-      mail: me.mail ?? null,
-      userPrincipalName: me.userPrincipalName ?? null,
-    }
+    return identity
   }
 
   /**
@@ -726,11 +909,19 @@ export class MicrosoftGraphProvider implements EmailProvider {
    * never full bodies or headers. Read-only: no D1 writes, no sends, no
    * cursor change.
    *
-   * Pagination: callers pass an opaque pageToken ($skiptoken), never a
-   * browser-provided URL. The server rebuilds the Inbox URL with the same
-   * window filter + skiptoken, so a malicious nextLink cannot redirect the
-   * bearer token or widen scope. Returns nextPageToken (skiptoken) only,
-   * never a full Graph URL.
+   * Pagination: callers pass an opaque pageToken issued by encodePageToken
+   * (which preserves the complete Microsoft paging state: $skip and/or
+   * $skiptoken + original $top), never a browser-provided URL. The server
+   * decodes + re-validates the token and rebuilds the Inbox URL with the
+   * same window filter + preserved paging state, so a malicious nextLink
+   * cannot redirect the bearer token or widen scope. Returns
+   * nextPageToken (opaque) only, never a full Graph URL.
+   *
+   * Page-size changes: if the token carries only $skip (no $skiptoken),
+   * the caller's $top is honored (skip offset is page-size independent).
+   * If the token carries $skiptoken, the original $top from the Graph
+   * nextLink is preserved, because Graph skiptokens are tied to the
+   * original query/page-size — changing $top with a skiptoken may fail.
    */
   async listInboxPreviewPage(options: {
     receivedStart: string
@@ -751,25 +942,33 @@ export class MicrosoftGraphProvider implements EmailProvider {
       'parentFolderId',
       'bodyPreview',
     ].join(',')
+    const requestedTop = Math.max(1, Math.min(100, options.top ?? 50))
     const params = new URLSearchParams({
       $select: select,
       $filter: `receivedDateTime ge ${options.receivedStart} and receivedDateTime lt ${options.receivedEnd}`,
       $orderby: 'receivedDateTime desc',
-      $top: String(Math.max(1, Math.min(100, options.top ?? 50))),
+      $top: String(requestedTop),
     })
     if (options.pageToken) {
-      // Rebuild the Inbox URL with the same window + skiptoken. The token
-      // itself is opaque; we never trust a browser-supplied host/path.
-      if (options.pageToken.length > 4096 || /[\r\n]/.test(options.pageToken))
-        throw new EmailProviderError('MS_GRAPH_INVALID_PAGINATION', 'Preview page token is invalid')
-      params.set('$skiptoken', options.pageToken)
+      const continuation = decodePageToken(options.pageToken)
+      // $skiptoken is tied to original query: preserve original $top.
+      if (continuation.skiptoken) {
+        params.set('$skiptoken', continuation.skiptoken)
+        if (continuation.top !== undefined) params.set('$top', String(continuation.top))
+      }
+      // $skip is offset-based: caller's $top is safe to use.
+      if (continuation.skip !== undefined) params.set('$skip', String(continuation.skip))
+      // If both present, both are set (Graph will use skiptoken; skip is harmless).
     }
     const page = await this.request<{
       value?: GraphMessage[]
       '@odata.nextLink'?: string
     }>(`/me/mailFolders/inbox/messages?${params.toString()}`)
     const nextPageToken = page['@odata.nextLink']
-      ? extractSkiptoken(page['@odata.nextLink'])
+      ? encodePageToken(page['@odata.nextLink'], {
+          receivedStart: options.receivedStart,
+          receivedEnd: options.receivedEnd,
+        })
       : null
     return { messages: page.value ?? [], nextPageToken: nextPageToken ?? undefined }
   }

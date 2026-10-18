@@ -1011,6 +1011,8 @@ export type AcknowledgeResult =
   | 'IN_FLIGHT_STALE'
   | 'MAILBOX_NOT_VERIFIED'
   | 'NO_SOURCE'
+  | 'WRONG_RECIPIENT'
+  | 'FORWARD_NOT_ACKABLE'
 
 export interface AcknowledgeOptions {
   /** Manual pilot: explicit owner action. Does NOT require emailAckEnabled. */
@@ -1067,6 +1069,28 @@ export async function acknowledgeComplaint(
     .bind(complaintId)
     .first<Record<string, unknown>>()
   if (!source) return 'NO_SOURCE'
+  // Recipient safety: Only ever ack the verified corporate source message.
+  // Graph /reply replies to the sender of the source message. If the source
+  // is a forward from a family member (e.g. Dad forwarding a Dunkin case)
+  // or a customer, /reply would go to that person, NOT to Dunkin — a
+  // wrong-recipient send. Refuse to send; import the original Dunkin
+  // message instead.
+  const senderRaw = String(source.sender ?? '')
+  const senderEmail = (senderRaw.match(/<([^>]+)>/)?.[1] ?? senderRaw.trim()).toLowerCase()
+  const senderDomain = senderEmail.split('@')[1] ?? ''
+  const personalDomains = ['yahoo.com', 'gmail.com', 'aol.com', 'outlook.com', 'hotmail.com', 'icloud.com', 'me.com', 'mac.com']
+  const isPersonal = personalDomains.includes(senderDomain)
+  // Dunkin corporate: @dunkinbrands.com, OR display name contains Dunkin
+  // and email is NOT a personal domain (covers test fixtures + any future
+  // Dunkin sender alias). Family members (yahoo/gmail) and customers
+  // (personal domains) are never Dunkin corporate, even if they put
+  // "Dunkin" in their display name.
+  const isDunkinCorporate =
+    senderEmail.endsWith('@dunkinbrands.com') ||
+    (!isPersonal && senderRaw.toLowerCase().includes('dunkin'))
+  if (!isDunkinCorporate) return 'WRONG_RECIPIENT'
+  const subjectRaw = String(source.subject ?? '').trim()
+  if (/^(fwd|fw|re)\s*:/i.test(subjectRaw)) return 'FORWARD_NOT_ACKABLE'
   const idempotencyKey = `email-ack:${complaintId}`
   const now = new Date().toISOString()
   await db
@@ -1209,18 +1233,30 @@ export type ReclaimAckResult =
   | 'NOT_IN_FLIGHT'
   | 'IN_FLIGHT_FRESH'
   | 'NEEDS_SENT_ITEMS_CHECK'
+  | 'NEEDS_FURTHER_RECONCILIATION'
 
 /**
- * Manual reclaim for stale IN_FLIGHT acks. The owner must have checked Graph
- * Sent Items / the thread and reports whether the reply is actually there.
+ * Manual reclaim for stale IN_FLIGHT acks. Ambiguous sends stay in a
+ * non-retryable pending-reconciliation state.
  * - sentConfirmed=true: mark SENT without sending again (no duplicate reply).
- * - sentConfirmed=false: reset to PENDING so a manual retry can be attempted.
+ * - sentConfirmed=false: DO NOT reset. Absence from Sent Items alone is NOT
+ *   conclusive proof the message wasn't sent (Graph may have accepted but
+ *   Sent Items hasn't updated, reply may be in another folder, check may
+ *   be incomplete). Returns NEEDS_FURTHER_RECONCILIATION and keeps
+ *   IN_FLIGHT. Only an explicit forceReset with a written reconciliation
+ *   note (what was checked, how, and why it is conclusive) resets to
+ *   PENDING for a manual retry — and that override is audited.
  * Never auto-reclaims, never sends.
  */
 export async function reclaimStaleAck(
   db: D1Database,
   complaintId: string,
-  options: { checkedSentItems: boolean; sentConfirmed: boolean },
+  options: {
+    checkedSentItems: boolean
+    sentConfirmed: boolean
+    forceReset?: boolean
+    reconciliationNote?: string
+  },
 ): Promise<ReclaimAckResult> {
   if (!options.checkedSentItems) return 'NEEDS_SENT_ITEMS_CHECK'
   const row = await db
@@ -1253,11 +1289,21 @@ export async function reclaimStaleAck(
     await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_RECLAIMED_SENT', complaintId, 'SUCCESS')
     return 'RECLAIMED_SENT'
   }
+  // sentConfirmed=false: stay IN_FLIGHT. Absence from Sent Items is not
+  // conclusive. Only an explicit, audited forceReset with a note resets.
+  if (!options.forceReset) {
+    await db
+      .prepare(`UPDATE email_acknowledgments SET last_error_code=?,updated_at=? WHERE id=?`)
+      .bind('AMBIGUOUS:NEEDS_FURTHER_RECONCILIATION', now, row.id)
+      .run()
+    return 'NEEDS_FURTHER_RECONCILIATION'
+  }
+  if (!options.reconciliationNote?.trim()) return 'NEEDS_FURTHER_RECONCILIATION'
   await db.batch([
     db.prepare(`UPDATE email_acknowledgments SET status='PENDING',last_error_code=NULL,updated_at=? WHERE id=? AND status='IN_FLIGHT'`).bind(now, row.id),
     db.prepare(`UPDATE complaints SET acknowledgement_status='PENDING',updated_at=? WHERE id=?`).bind(now, complaintId),
   ])
-  await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_RECLAIMED_PENDING', complaintId, 'SUCCESS')
+  await recordIntegrationEvent(db, 'ACKNOWLEDGMENT_RECLAIMED_PENDING', complaintId, 'SUCCESS', `forceReset: ${options.reconciliationNote.trim().slice(0, 500)}`)
   return 'RECLAIMED_TO_PENDING'
 }
 
