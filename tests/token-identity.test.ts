@@ -55,3 +55,20 @@ describe('Access token identity decoding (no User.Read needed)', () => {
     expect(decodeAccessTokenIdentity(makeToken({ ...base, iss: 'https://login.microsoftonline.com/other-tenant/v2.0' }), 'consumers')).toBeNull()
   })
 })
+
+describe('Token identity failure diagnosis (sanitized)', () => {
+  it('identifies NOT_JWT for opaque tokens', async () => {
+    const { diagnoseTokenIdentityFailure } = await import('../worker/microsoft-graph')
+    expect(diagnoseTokenIdentityFailure('opaque-token-no-dots')).toBe('NOT_JWT')
+  })
+  it('identifies BAD_AUDIENCE for wrong aud', async () => {
+    const { diagnoseTokenIdentityFailure } = await import('../worker/microsoft-graph')
+    const token = makeToken({ ...VALID_CLAIMS, aud: 'https://wrong.example.com', upn: 'a@b.c' })
+    expect(diagnoseTokenIdentityFailure(token)).toBe('BAD_AUDIENCE')
+  })
+  it('identifies NO_IDENTITY_CLAIMS when claims missing', async () => {
+    const { diagnoseTokenIdentityFailure } = await import('../worker/microsoft-graph')
+    const token = makeToken({ ...VALID_CLAIMS })
+    expect(diagnoseTokenIdentityFailure(token)).toBe('NO_IDENTITY_CLAIMS')
+  })
+})

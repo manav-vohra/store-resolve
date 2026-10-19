@@ -347,7 +347,69 @@ export function encodePageToken(
  * approval-gated change. For our flow — token fetched fresh from Microsoft
  * over TLS, then decoded in-process — iss/aud/exp validation + TLS
  * provenance is the correct authenticity check.
+ *
+ * Diagnostic variant: returns the sanitized failure category instead of
+ * null, so operators can see WHICH check fails without exposing the token.
+ * Categories: NOT_JWT | BAD_HEADER | BAD_ISSUER | BAD_AUDIENCE |
+ * EXPIRED | NO_IDENTITY_CLAIMS | DECODE_ERROR. No token material, claims,
+ * or personal data is ever returned — only the category string.
  */
+export type TokenIdentityFailure =
+  | 'NOT_JWT'
+  | 'BAD_HEADER'
+  | 'BAD_ISSUER'
+  | 'BAD_AUDIENCE'
+  | 'EXPIRED'
+  | 'NO_IDENTITY_CLAIMS'
+  | 'DECODE_ERROR'
+
+export function diagnoseTokenIdentityFailure(token: string): TokenIdentityFailure {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return 'NOT_JWT'
+    const headerB64 = parts[0].replace(/-/g, '+').replace(/_/g, '/')
+    const headerPadded = headerB64 + '='.repeat((4 - (headerB64.length % 4)) % 4)
+    let header: Record<string, unknown>
+    try {
+      header = JSON.parse(
+        new TextDecoder().decode(Uint8Array.from(atob(headerPadded), (c) => c.charCodeAt(0))),
+      ) as Record<string, unknown>
+    } catch {
+      return 'DECODE_ERROR'
+    }
+    if (header.alg !== 'RS256' || header.typ !== 'JWT') return 'BAD_HEADER'
+    const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = payloadB64 + '='.repeat((4 - (payloadB64.length % 4)) % 4)
+    let claims: Record<string, unknown>
+    try {
+      claims = JSON.parse(
+        new TextDecoder().decode(Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))),
+      ) as Record<string, unknown>
+    } catch {
+      return 'DECODE_ERROR'
+    }
+    const iss = typeof claims.iss === 'string' ? claims.iss : null
+    if (!iss || !/^https:\/\/login\.microsoftonline\.com\/[^/]+\/v2\.0$/.test(iss)) return 'BAD_ISSUER'
+    const aud = claims.aud
+    const audOk =
+      aud === 'https://graph.microsoft.com' ||
+      (Array.isArray(aud) && aud.includes('https://graph.microsoft.com'))
+    if (!audOk) return 'BAD_AUDIENCE'
+    const nowSec = Math.floor(Date.now() / 1000)
+    const exp = typeof claims.exp === 'number' ? claims.exp : null
+    if (exp === null || exp <= nowSec - 60) return 'EXPIRED'
+    const upn = typeof claims.upn === 'string' ? claims.upn : null
+    const preferred = typeof claims.preferred_username === 'string' ? claims.preferred_username : null
+    const email = typeof claims.email === 'string' ? claims.email : null
+    if (!upn && !preferred && !email) return 'NO_IDENTITY_CLAIMS'
+    // All checks passed but decodeAccessTokenIdentity returned null anyway
+    // (should not happen — indicates a logic drift between the two functions).
+    return 'DECODE_ERROR'
+  } catch {
+    return 'DECODE_ERROR'
+  }
+}
+
 export function decodeAccessTokenIdentity(
   token: string,
   expectedTenant?: string,
@@ -631,6 +693,21 @@ export class MicrosoftGraphProvider implements EmailProvider {
         'Microsoft Graph access token failed identity validation (iss/aud/exp/claims)',
       )
     return identity
+  }
+
+  /**
+   * Diagnostic: returns the sanitized failure category for the current
+   * access token WITHOUT exposing the token or its claims. Owner-only
+   * diagnostic use. Never logs or returns token material.
+   */
+  async diagnoseMailboxIdentityFailure(): Promise<TokenIdentityFailure | 'TOKEN_UNAVAILABLE'> {
+    let token: string
+    try {
+      token = await this.accessToken()
+    } catch {
+      return 'TOKEN_UNAVAILABLE'
+    }
+    return diagnoseTokenIdentityFailure(token)
   }
 
   /**

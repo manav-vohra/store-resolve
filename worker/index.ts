@@ -546,7 +546,16 @@ app.get('/api/admin/email/mailbox-identity', async (c) => {
     })
   } catch (error) {
     const code = error instanceof EmailProviderError ? error.code : 'MAILBOX_IDENTITY_FAILED'
-    return c.json(jsonError(code), 503)
+    // Sanitized diagnostic: which check fails, without token material.
+    let tokenDiagnosis: string | null = null
+    if (code === 'MS_GRAPH_TOKEN_IDENTITY_MISSING' && typeof graph.diagnoseMailboxIdentityFailure === 'function') {
+      try {
+        tokenDiagnosis = await graph.diagnoseMailboxIdentityFailure()
+      } catch {
+        tokenDiagnosis = 'DIAGNOSIS_UNAVAILABLE'
+      }
+    }
+    return c.json({ ...jsonError(code), tokenDiagnosis }, 503)
   }
 })
 
