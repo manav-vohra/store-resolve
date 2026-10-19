@@ -1579,6 +1579,18 @@ app.post('/api/admin/email/discover', async (c) => {
   const state = await loadState(c.env.DB)
   if (!state.config.emailIngestionEnabled)
     return c.json({ ok: false, ran: false, reason: 'INGESTION_DISABLED' })
+  // Pilot guard: during Dad-only pilot, all scheduled discovery must go
+  // through runDadPilotDiscoveryTick() (activation boundary + Dad push).
+  // This legacy path bypasses both — refuse while pilot ingestion is on.
+  const pilotTickActive = await c.env.DB.prepare(
+    `SELECT value FROM settings WHERE key='email_ingestion_enabled'`,
+  )
+    .first<{ value: string }>()
+  if (pilotTickActive?.value === 'true')
+    return c.json(
+      jsonError('PILOT_TICK_ONLY: use the Dad pilot discovery tick during pilot'),
+      503,
+    )
   const graph = emailProvider(c.env)
   if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
   // Optional date window (bounds historical mail on initial delta). When
