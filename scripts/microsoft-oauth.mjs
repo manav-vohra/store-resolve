@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline/promises'
 
 export const authority = 'https://login.microsoftonline.com/consumers'
-export const scopes = 'openid profile email offline_access Mail.Read Mail.Send'
+export const scopes = 'openid profile email offline_access Mail.Read Mail.Send User.Read'
 export const oidcConfigurationUrl = `${authority}/v2.0/.well-known/openid-configuration`
 export const graphReadinessUrl =
   'https://graph.microsoft.com/v1.0/me/mailFolders/inbox?$select=id,displayName,totalItemCount,unreadItemCount'
@@ -215,6 +215,26 @@ export function confirmExpectedMailbox(claims, expectedMailbox) {
 
 const graphHeaders = (accessToken) => ({ authorization: `Bearer ${accessToken}` })
 
+export const graphIdentityUrl =
+  'https://graph.microsoft.com/v1.0/me?$select=id,displayName,mail,userPrincipalName'
+
+export async function verifyGraphIdentity(accessToken, expectedMailbox, fetchImpl = fetch) {
+  const response = await fetchImpl(graphIdentityUrl, { headers: graphHeaders(accessToken) })
+  if (!response.ok)
+    throw new Error('Microsoft Graph /me identity verification failed (User.Read consent may be missing).')
+  const profile = await safeJson(response)
+  const identifiers = [profile.mail, profile.userPrincipalName].filter(
+    (value) => typeof value === 'string' && value.length > 0,
+  )
+  if (identifiers.length === 0)
+    throw new Error('Microsoft Graph /me returned no usable mailbox identity.')
+  const expected = expectedMailbox.toLowerCase()
+  const normalized = identifiers.map((value) => value.toLowerCase())
+  if (!normalized.includes(expected))
+    throw new Error('Microsoft Graph /me identity does not match MS_MAILBOX_ADDRESS.')
+  return { maskedIdentity: maskMailbox(identifiers[0]), matches: true }
+}
+
 export async function verifyGraphReadiness(accessToken, fetchImpl = fetch) {
   const response = await fetchImpl(graphReadinessUrl, { headers: graphHeaders(accessToken) })
   if (!response.ok) throw new Error('Microsoft Graph readiness verification failed.')
@@ -266,6 +286,11 @@ export async function authorizeExpectedMailbox({
   log(`AUTHORIZED_MICROSOFT_IDENTITY=${confirmation.maskedIdentity}`)
   log(`EXPECTED_MAILBOX_MATCH=${confirmation.matches ? 'YES' : 'NO'}`)
   if (!confirmation.matches) throw new Error(confirmation.reason)
+  // Verify /me identity (User.Read) matches BEFORE replacing the production
+  // refresh token. This proves the new consent actually grants identity access.
+  const graphIdentity = await verifyGraphIdentity(tokens.accessToken, expectedMailbox, fetchImpl)
+  log(`GRAPH_ME_IDENTITY=${graphIdentity.maskedIdentity}`)
+  log(`GRAPH_ME_MATCH=YES`)
   await storeToken(tokens.refreshToken)
   log('MS_REFRESH_TOKEN was written directly to Cloudflare and was not displayed.')
   await verifyGraphReadiness(tokens.accessToken, fetchImpl)

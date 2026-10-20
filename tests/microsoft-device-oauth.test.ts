@@ -87,6 +87,16 @@ const oidcFetch = (idToken = createIdToken()) =>
         }),
         { status: 200 },
       )
+    if (url.startsWith('https://graph.microsoft.com/v1.0/me?'))
+      return new Response(
+        JSON.stringify({
+          id: 'user-id-123',
+          displayName: 'Complaints Mailbox',
+          mail: expectedMailbox,
+          userPrincipalName: expectedMailbox,
+        }),
+        { status: 200 },
+      )
     if (url === graphReadinessUrl)
       return new Response(
         JSON.stringify({
@@ -122,7 +132,7 @@ describe('Microsoft device-code OAuth bootstrap', () => {
     expect(url).toBe(`${authority}/oauth2/v2.0/devicecode`)
     const body = new URLSearchParams(String(init.body))
     expect(body.get('client_id')).toBe(clientId)
-    expect(body.get('scope')).toBe('openid profile email offline_access Mail.Read Mail.Send')
+    expect(body.get('scope')).toBe('openid profile email offline_access Mail.Read Mail.Send User.Read')
     expect(body.get('scope')).toBe(scopes)
     expect(body.has('client_secret')).toBe(false)
     expect(body.has('nonce')).toBe(false)
@@ -205,7 +215,11 @@ describe('Microsoft device-code OAuth bootstrap', () => {
     const graphCalls = (fetchImpl.mock.calls as unknown[][]).filter(([url]) =>
       String(url).startsWith('https://graph.microsoft.com/'),
     )
-    expect(graphCalls.map(([url]) => url)).toEqual([graphReadinessUrl, graphSanityUrl])
+    expect(graphCalls.map(([url]) => url)).toEqual([
+      expect.stringContaining('/v1.0/me?'),
+      graphReadinessUrl,
+      graphSanityUrl,
+    ])
     expect(graphSanityUrl).toContain('$top=3')
     expect(graphSanityUrl).toContain('$select=id,receivedDateTime,from')
     expect(graphSanityUrl).not.toMatch(/subject|body|preview|recipient|attachment/i)

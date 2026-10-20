@@ -138,6 +138,7 @@ const GRAPH_SCOPES = [
   'offline_access',
   'https://graph.microsoft.com/Mail.Read',
   'https://graph.microsoft.com/Mail.Send',
+  'https://graph.microsoft.com/User.Read',
 ].join(' ')
 
 /**
@@ -153,7 +154,8 @@ export function validateGraphRequestUrl(path: string): string {
   if (path.startsWith('/')) {
     if (path.includes('..') || path.includes('\\'))
       throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is invalid')
-    if (!path.startsWith('/me/'))
+    // Permit exactly /me (identity lookup) and /me/... (mailbox scope).
+    if (path !== '/me' && !path.startsWith('/me/'))
       throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must target /me/')
     return `${GRAPH_ROOT}${path}`
   }
@@ -173,7 +175,7 @@ export function validateGraphRequestUrl(path: string): string {
     throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must not include credentials')
   if (url.hash)
     throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must not include a fragment')
-  if (!url.pathname.startsWith('/v1.0/me/'))
+  if (!url.pathname.startsWith('/v1.0/me/') && url.pathname !== '/v1.0/me')
     throw new EmailProviderError(
       'MS_GRAPH_INVALID_URL',
       'Graph request must target the /me/ mailbox scope',
@@ -683,16 +685,41 @@ export class MicrosoftGraphProvider implements EmailProvider {
    * issuer because we just received it from login.microsoftonline.com).
    * Never log the token or its claims beyond the masked identity.
    */
+  /**
+   * Phase 2 — Mailbox identity proof via Graph GET /me (delegated User.Read).
+   *
+   * Microsoft documents Graph access tokens as opaque to clients; the
+   * previous token-JWT decoding approach is retired. This calls the
+   * authenticated /me endpoint and returns only the identity properties
+   * needed to verify the connected mailbox. Requires User.Read consent.
+   * Never logs the token or identity beyond the masked values returned
+   * by verifyMailboxIdentity's caller.
+   */
   async getMailboxIdentity(): Promise<MailboxIdentity> {
-    const token = await this.accessToken()
-    const expectedTenant = this.config.tenant?.trim() || 'consumers'
-    const identity = decodeAccessTokenIdentity(token, expectedTenant)
-    if (!identity)
+    const profile = await this.request<{
+      id?: string
+      displayName?: string
+      mail?: string
+      userPrincipalName?: string
+    }>(`/me?$select=${encodeURIComponent('id,displayName,mail,userPrincipalName')}`)
+    const principal =
+      typeof profile.userPrincipalName === 'string' && profile.userPrincipalName.length > 0
+        ? profile.userPrincipalName
+        : typeof profile.mail === 'string' && profile.mail.length > 0
+          ? profile.mail
+          : null
+    if (!principal)
       throw new EmailProviderError(
-        'MS_GRAPH_TOKEN_IDENTITY_MISSING',
-        'Microsoft Graph access token failed identity validation (iss/aud/exp/claims)',
+        'MS_GRAPH_IDENTITY_MISSING',
+        'Microsoft Graph /me returned no usable identity (userPrincipalName/mail)',
       )
-    return identity
+    return {
+      id: typeof profile.id === 'string' ? profile.id : principal,
+      displayName: typeof profile.displayName === 'string' ? profile.displayName : principal,
+      mail: typeof profile.mail === 'string' ? profile.mail : null,
+      userPrincipalName:
+        typeof profile.userPrincipalName === 'string' ? profile.userPrincipalName : null,
+    }
   }
 
   /**

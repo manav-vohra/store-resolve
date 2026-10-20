@@ -53,6 +53,7 @@ describe('Microsoft Graph delegated mail provider', () => {
       'offline_access',
       'https://graph.microsoft.com/Mail.Read',
       'https://graph.microsoft.com/Mail.Send',
+      'https://graph.microsoft.com/User.Read',
     ])
     expect(form.has('client_secret')).toBe(false)
     const readinessUrl = new URL(String(fetch.mock.calls[1][0]))
