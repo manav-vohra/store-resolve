@@ -286,17 +286,17 @@ export async function authorizeExpectedMailbox({
   log(`AUTHORIZED_MICROSOFT_IDENTITY=${confirmation.maskedIdentity}`)
   log(`EXPECTED_MAILBOX_MATCH=${confirmation.matches ? 'YES' : 'NO'}`)
   if (!confirmation.matches) throw new Error(confirmation.reason)
-  // Verify /me identity (User.Read) matches BEFORE replacing the production
-  // refresh token. This proves the new consent actually grants identity access.
+  // Verify /me identity (User.Read) AND inbox access BEFORE replacing the
+  // production refresh token. Never risk interrupting working ingestion.
   const graphIdentity = await verifyGraphIdentity(tokens.accessToken, expectedMailbox, fetchImpl)
   log(`GRAPH_ME_IDENTITY=${graphIdentity.maskedIdentity}`)
   log(`GRAPH_ME_MATCH=YES`)
-  await storeToken(tokens.refreshToken)
-  log('MS_REFRESH_TOKEN was written directly to Cloudflare and was not displayed.')
   await verifyGraphReadiness(tokens.accessToken, fetchImpl)
   log('MICROSOFT_GRAPH_READY=YES')
   const sanityCount = await runMailboxMetadataSanityCheck(tokens.accessToken, fetchImpl)
   log(`AUGUST_1_METADATA_RECORD_COUNT=${sanityCount}`)
+  await storeToken(tokens.refreshToken)
+  log('MS_REFRESH_TOKEN was written directly to Cloudflare and was not displayed.')
   return { ...confirmation, graphReady: true, sanityCount }
 }
 
