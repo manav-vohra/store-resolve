@@ -34,6 +34,7 @@ export function ResponseComposer({
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editBody, setEditBody] = useState('')
   const [sendingId, setSendingId] = useState<string | null>(null)
+  const [notifyMsg, setNotifyMsg] = useState<string | null>(null)
 
   async function load() {
     setLoading(true)
@@ -124,11 +125,11 @@ export function ResponseComposer({
   async function notifyDad(id: string) {
     setLoading(true)
     setError(null)
+    setNotifyMsg(null)
     try {
       const res = await api.notifyDraftReady(id)
       if (res.sent) {
-        setError(null)
-        alert('Dad notified — push sent to his iPhone.')
+        setNotifyMsg('Dad notified — push sent to his iPhone.')
       } else {
         setError(`Notification not sent: ${res.reason ?? 'unknown'}`)
       }
@@ -262,6 +263,7 @@ export function ResponseComposer({
       ))}
 
       {error && <p style={{ color: '#b00', marginTop: 8 }}>{error}</p>}
+      {notifyMsg && <p style={{ color: 'green', marginTop: 8 }}>{notifyMsg}</p>}
     </section>
   )
 }
