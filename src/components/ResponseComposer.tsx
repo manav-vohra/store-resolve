@@ -121,6 +121,25 @@ export function ResponseComposer({
     }
   }
 
+  async function notifyDad(id: string) {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await api.notifyDraftReady(id)
+      if (res.sent) {
+        setError(null)
+        alert('Dad notified — push sent to his iPhone.')
+      } else {
+        setError(`Notification not sent: ${res.reason ?? 'unknown'}`)
+      }
+      await load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Notify failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const stateLabel = (state: string) => {
     switch (state) {
       case 'DRAFT': return 'Draft — not yet submitted'
@@ -203,6 +222,9 @@ export function ResponseComposer({
                   </button>
                   <button className="secondary" onClick={() => transition(a.id, 'submit')} disabled={loading}>
                     Submit for approval
+                  </button>
+                  <button className="secondary" onClick={() => notifyDad(a.id)} disabled={loading}>
+                    Notify Dad
                   </button>
                 </>
               )}
