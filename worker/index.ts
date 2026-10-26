@@ -1490,6 +1490,29 @@ app.post(
         complaintId: c.req.param('id'),
         ...c.req.valid('json'),
       })
+      // Forward hook: when someone OTHER than Dad prepares a draft, notify
+      // Dad it's ready for his review. Dad's own drafts need no notification
+      // (he just wrote it). Edits never notify — only creation does.
+      // Failures are audited inside notifyDadDraftReady; the draft is created
+      // regardless.
+      if (user.id !== 'dad') {
+        try {
+          const complaint = await c.env.DB
+            .prepare('SELECT external_case_id FROM complaints WHERE id=?')
+            .bind(c.req.param('id'))
+            .first<{ external_case_id: string }>()
+          if (complaint) {
+            const { notifyDadDraftReady } = await import('./dad-push')
+            await notifyDadDraftReady(c.env.DB, c.env, {
+              id: draft.id,
+              complaintId: c.req.param('id'),
+              externalCaseId: complaint.external_case_id,
+            })
+          }
+        } catch {
+          // Notification failure never blocks draft creation.
+        }
+      }
       return c.json({ ok: true, draft })
     } catch (error) {
       if (error instanceof ResponseWorkflowError)
@@ -1501,6 +1524,32 @@ app.post(
     }
   },
 )
+
+// One-time / manual draft-ready notification for an existing draft.
+// Owner-only. Idempotent: a draft already push-notified (SENT) is skipped.
+app.post('/api/admin/notify-draft-ready/:draftId', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const draft = await c.env.DB
+    .prepare('SELECT id, complaint_id, policy_state FROM response_actions WHERE id=?')
+    .bind(c.req.param('draftId'))
+    .first<{ id: string; complaint_id: string; policy_state: string }>()
+  if (!draft) return c.json(jsonError('Draft not found'), 404)
+  if (draft.policy_state !== 'DRAFT')
+    return c.json(jsonError(`Draft is ${draft.policy_state}, not DRAFT`), 409)
+  const complaint = await c.env.DB
+    .prepare('SELECT external_case_id FROM complaints WHERE id=?')
+    .bind(draft.complaint_id)
+    .first<{ external_case_id: string }>()
+  if (!complaint) return c.json(jsonError('Complaint not found'), 404)
+  const { notifyDadDraftReady } = await import('./dad-push')
+  const result = await notifyDadDraftReady(c.env.DB, c.env, {
+    id: draft.id,
+    complaintId: draft.complaint_id,
+    externalCaseId: complaint.external_case_id,
+  })
+  return c.json({ ok: true, ...result })
+})
 
 app.post(
   '/api/response-actions/:id/approve',

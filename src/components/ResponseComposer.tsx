@@ -135,7 +135,7 @@ export function ResponseComposer({
   }
 
   return (
-    <section className="panel">
+    <section className="panel" id="reply-to-dunkin">
       <div className="panel-head">
         <div>
           <h2>Reply to Dunkin</h2>

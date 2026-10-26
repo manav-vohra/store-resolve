@@ -300,6 +300,23 @@ export function buildNewComplaintPushPayload(complaint: {
 }
 
 /**
+ * Dad-only draft-ready push. Fires once per draft, when a reply is prepared
+ * for Dad's review. Tapping opens the complaint scrolled to the Reply section.
+ */
+export function buildDraftReadyPushPayload(draft: {
+  id: string
+  complaintId: string
+  externalCaseId: string
+}): WebPushPayload {
+  return {
+    title: 'StoreResolve',
+    body: `Reply ready for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+    url: `/#/complaints/${draft.complaintId}/reply`,
+    tag: `draft-ready-${draft.id}`,
+  }
+}
+
+/**
  * Send one encrypted push message. Throws on transport/provider errors.
  * A 404/410 resolves to `{expired: true}` instead of throwing so the caller
  * can revoke the subscription.

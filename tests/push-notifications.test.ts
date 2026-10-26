@@ -415,8 +415,9 @@ describe('webpush crypto', () => {
 
 describe('deep links', () => {
   it('parses #/complaints/:id and rejects anything else', () => {
-    expect(parseComplaintHash('#/complaints/SR-2026-0002')).toBe('SR-2026-0002')
-    expect(parseComplaintHash('#/complaints/SR-2026-0002/')).toBe('SR-2026-0002')
+    expect(parseComplaintHash('#/complaints/SR-2026-0002')).toEqual({ id: 'SR-2026-0002', section: undefined })
+    expect(parseComplaintHash('#/complaints/SR-2026-0002/')).toEqual({ id: 'SR-2026-0002', section: undefined })
+    expect(parseComplaintHash('#/complaints/SR-2026-0002/reply')).toEqual({ id: 'SR-2026-0002', section: 'reply' })
     expect(parseComplaintHash('#/')).toBeUndefined()
     expect(parseComplaintHash('')).toBeUndefined()
     expect(parseComplaintHash('#/complaints/')).toBeUndefined()

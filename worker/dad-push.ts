@@ -15,7 +15,7 @@
  *   push-notified (SENT record exists) is skipped.
  */
 import { WebPushProvider } from './providers'
-import { buildNewComplaintPushPayload } from './webpush'
+import { buildDraftReadyPushPayload, buildNewComplaintPushPayload } from './webpush'
 import type { D1Database } from './d1'
 
 interface DadPushEnv {
@@ -340,4 +340,124 @@ export async function retryFailedDadPushes(
     }
   }
   return out
+}
+
+/**
+ * Dad-only draft-ready push notification.
+ *
+ * Fires once per response draft, when a reply is prepared for Dad's review.
+ * Edits never re-notify: dedup is by (event_type='DRAFT_READY', draft id
+ * stored in provider_message_id). A SENT record for the draft blocks any
+ * second push, even if the draft is edited, resubmitted, or re-approved.
+ *
+ * Same gates as new-complaint pushes: dad_push_enabled kill switch,
+ * FAMILY_PILOT mode, active subscription, Web Push configured. Never
+ * breaks the caller — all failures are audited and swallowed.
+ */
+export async function notifyDadDraftReady(
+  db: D1Database,
+  env: DadPushEnv,
+  draft: { id: string; complaintId: string; externalCaseId: string },
+): Promise<{ sent: boolean; reason?: string }> {
+  const now = new Date().toISOString()
+  try {
+    const pushSwitch = await db
+      .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
+      .first<{ value: string }>()
+    if (pushSwitch?.value !== 'true') return { sent: false, reason: 'PUSH_DISABLED' }
+
+    const mode = await db
+      .prepare(`SELECT value FROM settings WHERE key='notification_mode'`)
+      .first<{ value: string }>()
+    if (mode?.value !== 'FAMILY_PILOT') return { sent: false, reason: 'NOT_FAMILY_PILOT' }
+
+    // Idempotency: one push per draft, ever. Edits do not re-notify.
+    const existing = await db
+      .prepare(
+        `SELECT id FROM notifications WHERE event_type='DRAFT_READY' AND provider_message_id=? AND channel='PUSH' AND status='SENT'`,
+      )
+      .bind(draft.id)
+      .first<{ id: string }>()
+    if (existing) return { sent: false, reason: 'ALREADY_SENT' }
+
+    const sub = await db
+      .prepare(
+        `SELECT endpoint, p256dh_key, auth_key FROM push_subscriptions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC LIMIT 1`,
+      )
+      .bind(DAD_USER_ID)
+      .first<{ endpoint: string; p256dh_key: string; auth_key: string }>()
+    if (!sub) {
+      await recordDraft(db, draft, 'SKIPPED', 'NO_PUSH_SUBSCRIPTION', now)
+      return { sent: false, reason: 'NO_PUSH_SUBSCRIPTION' }
+    }
+
+    const push = webPush(env)
+    if (!push.ready) {
+      await recordDraft(db, draft, 'SKIPPED', 'WEBPUSH_NOT_READY', now)
+      return { sent: false, reason: 'WEBPUSH_NOT_READY' }
+    }
+
+    try {
+      const result = await push.sendToSubscription(
+        { endpoint: sub.endpoint, p256dhKey: sub.p256dh_key, authKey: sub.auth_key },
+        buildDraftReadyPushPayload(draft),
+      )
+      if (result.expired) {
+        await db
+          .prepare(`UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND revoked_at IS NULL`)
+          .bind(now, sub.endpoint)
+          .run()
+        await recordDraft(db, draft, 'FAILED', 'SUBSCRIPTION_EXPIRED', now)
+        return { sent: false, reason: 'SUBSCRIPTION_EXPIRED' }
+      }
+      await db
+        .prepare(`UPDATE push_subscriptions SET last_used_at=? WHERE endpoint=?`)
+        .bind(now, sub.endpoint)
+        .run()
+      await recordDraft(db, draft, 'SENT', null, now)
+      return { sent: true }
+    } catch (error) {
+      const msg = (error as Error).message
+      const uncertain = /timeout|timed out|5\d\d|network|econn|socket|abort/i.test(msg)
+      const status = uncertain ? 'NEEDS_RECONCILIATION' : 'FAILED'
+      await recordDraft(db, draft, status, msg.slice(0, 500), now)
+      return { sent: false, reason: uncertain ? 'SEND_UNCERTAIN' : 'SEND_FAILED' }
+    }
+  } catch (error) {
+    try {
+      await recordDraft(db, draft, 'FAILED', `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, now)
+    } catch {
+      // Even the audit write failed; nothing more we can do.
+    }
+    return { sent: false, reason: 'INTERNAL_ERROR' }
+  }
+}
+
+async function recordDraft(
+  db: D1Database,
+  draft: { id: string; complaintId: string; externalCaseId: string },
+  status: 'SENT' | 'FAILED' | 'SKIPPED' | 'NEEDS_RECONCILIATION',
+  reason: string | null,
+  now: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      draft.complaintId,
+      'DRAFT_READY',
+      DAD_USER_ID,
+      'PUSH',
+      `Reply ready for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+      status,
+      'WEBPUSH',
+      draft.id,
+      now,
+      status === 'SENT' ? now : null,
+      status === 'FAILED' ? now : null,
+      reason,
+    )
+    .run()
 }

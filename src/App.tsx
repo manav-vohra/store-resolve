@@ -162,14 +162,15 @@ export default function App() {
     const timer = window.setInterval(checkVersion, 10_000)
     return () => window.clearInterval(timer)
   }, [loading])
-  // Deep-link handling: open `#/complaints/:id` on cold start (e.g. a push
-  // notification tap) and on in-app hash changes. Idempotent — re-runs are
-  // no-ops when the requested complaint is already open.
+  // Deep-link handling: open `#/complaints/:id` (or `#/complaints/:id/reply`)
+  // on cold start (e.g. a push notification tap) and on in-app hash changes.
+  // Idempotent — re-runs are no-ops when the requested complaint is already open.
   useEffect(() => {
     if (loading) return
     const openFromHash = () => {
-      const id = parseComplaintHash(window.location.hash)
-      if (!id) return
+      const parsed = parseComplaintHash(window.location.hash)
+      if (!parsed) return
+      const id = parsed.id
       const allowed =
         user.role === 'STORE_MANAGER'
           ? state.complaints.some((c) => c.id === id && c.assignedManagerId === user.id)
@@ -178,11 +179,25 @@ export default function App() {
         show('Complaint not found or not available to you')
         return
       }
-      if (view === 'detail' && selectedId === id) return
+      if (view === 'detail' && selectedId === id) {
+        // Already open: just scroll to the requested section.
+        if (parsed.section === 'reply') {
+          requestAnimationFrame(() => {
+            document.getElementById('reply-to-dunkin')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+          })
+        }
+        return
+      }
       setView('detail')
       setSelectedId(id)
       setSidebarOpen(false)
       window.scrollTo(0, 0)
+      // After the detail renders, scroll to the Reply section if requested.
+      if (parsed.section === 'reply') {
+        setTimeout(() => {
+          document.getElementById('reply-to-dunkin')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }, 300)
+      }
     }
     openFromHash()
     window.addEventListener('hashchange', openFromHash)
