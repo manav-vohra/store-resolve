@@ -25,10 +25,13 @@ export type ResponseActionPolicyState =
   | 'APPROVED'
   | 'REJECTED'
   | 'SEND_BLOCKED'
+  | 'SENT'
+  | 'SEND_FAILED'
+  | 'NEEDS_RECONCILIATION'
 
 export class ResponseWorkflowError extends Error {
   constructor(
-    readonly code: 'TEMPLATE_NOT_FOUND' | 'COMPLAINT_NOT_FOUND' | 'INVALID_TRANSITION' | 'SEND_DISABLED' | 'SEND_NOT_WIRED' | 'ACTION_NOT_FOUND',
+    readonly code: 'TEMPLATE_NOT_FOUND' | 'COMPLAINT_NOT_FOUND' | 'INVALID_TRANSITION' | 'SEND_DISABLED' | 'SEND_NOT_WIRED' | 'ACTION_NOT_FOUND' | 'NOT_APPROVED' | 'WRONG_RECIPIENT' | 'NO_SOURCE' | 'ALREADY_SENT' | 'MAILBOX_NOT_VERIFIED' | 'AMBIGUOUS_SEND',
     message: string,
   ) {
     super(message)
@@ -241,28 +244,116 @@ export const rejectResponseAction = (
   transitionState(db, input.id, ['PENDING_APPROVAL'], 'REJECTED', { approvedBy: input.rejectedBy })
 
 /**
- * Sending is disabled in Phase C. This function never performs an external
- * send: it throws SEND_DISABLED when the ack flag is off (the default) and
- * SEND_NOT_WIRED when it is on (no transport exists yet).
+ * Dad-approved response send. Gated by explicit APPROVED state, NOT by the
+ * global email_ack_enabled switch (which stays OFF — automatic acks are
+ * separate from Dad-approved sends).
+ *
+ * Safety rules (mirroring acknowledgeComplaint):
+ * - Action must be APPROVED (Dad explicitly approved this exact draft).
+ * - Mailbox identity must be verified via Graph /me before sending.
+ * - Recipient safety: only replies to verified Dunkin corporate source
+ *   messages. Forwards and personal-domain senders are refused.
+ * - Idempotency: SENT actions never re-send. IN_FLIGHT/ambiguous results
+ *   become NEEDS_RECONCILIATION — never auto-retried, owner must check
+ *   Sent Items and reclaim manually.
+ * - The approved draft body (content_ref) is sent verbatim via Graph /reply
+ *   into the original conversation thread.
  */
 export async function sendResponseAction(
   db: D1Database,
-  input: { id: string; emailAckEnabled: boolean },
-): Promise<never> {
+  input: {
+    id: string
+    emailProvider: {
+      sendAcknowledgment: (
+        message: { id: string; threadId: string; internalDate: string; sender: string; recipients: string; subject: string; textBody: string },
+        body: string,
+      ) => Promise<unknown>
+    }
+    mailboxIdentityVerified: boolean
+  },
+): Promise<ResponseAction> {
   const row = await db
-    .prepare('SELECT id,policy_state FROM response_actions WHERE id=?')
+    .prepare('SELECT * FROM response_actions WHERE id=?')
     .bind(input.id)
-    .first<{ id: string; policy_state: string }>()
+    .first<Record<string, unknown>>()
   if (!row) throw new ResponseWorkflowError('ACTION_NOT_FOUND', `response action ${input.id} not found`)
-  if (!input.emailAckEnabled)
+  const action = toAction(row)
+  if (action.policyState === 'SENT')
+    throw new ResponseWorkflowError('ALREADY_SENT', `response action ${input.id} was already sent`)
+  if (action.policyState === 'NEEDS_RECONCILIATION')
     throw new ResponseWorkflowError(
-      'SEND_DISABLED',
-      'sending is disabled: email_ack_enabled=false (Phase C never sends)',
+      'AMBIGUOUS_SEND',
+      `response action ${input.id} has an uncertain send outcome — check Sent Items before retrying`,
     )
-  throw new ResponseWorkflowError(
-    'SEND_NOT_WIRED',
-    'email_ack_enabled is on but no send transport is wired in Phase C; refusing rather than sending',
-  )
+  if (action.policyState !== 'APPROVED')
+    throw new ResponseWorkflowError(
+      'NOT_APPROVED',
+      `response action ${input.id} is ${action.policyState}, not APPROVED`,
+    )
+  if (!input.mailboxIdentityVerified)
+    throw new ResponseWorkflowError('MAILBOX_NOT_VERIFIED', 'mailbox identity must be verified before sending')
+
+  // Load the complaint's original source message for recipient safety + thread.
+  const source = await db
+    .prepare(
+      `SELECT gm.* FROM gmail_messages gm WHERE gm.complaint_id=? AND gm.is_follow_up=0 ORDER BY gm.first_seen_at LIMIT 1`,
+    )
+    .bind(action.complaintId)
+    .first<Record<string, unknown>>()
+  if (!source) throw new ResponseWorkflowError('NO_SOURCE', `complaint ${action.complaintId} has no source message`)
+
+  // Recipient safety: same rules as acknowledgeComplaint.
+  const senderRaw = String(source.sender ?? '')
+  const senderEmail = (senderRaw.match(/<([^>]+)>/)?.[1] ?? senderRaw.trim()).toLowerCase()
+  const senderDomain = senderEmail.split('@')[1] ?? ''
+  const personalDomains = ['yahoo.com', 'gmail.com', 'aol.com', 'outlook.com', 'hotmail.com', 'icloud.com', 'me.com', 'mac.com']
+  const isPersonal = personalDomains.includes(senderDomain)
+  const isDunkinCorporate =
+    senderEmail.endsWith('@dunkinbrands.com') ||
+    (!isPersonal && senderRaw.toLowerCase().includes('dunkin'))
+  if (!isDunkinCorporate)
+    throw new ResponseWorkflowError('WRONG_RECIPIENT', 'source message is not from Dunkin corporate')
+  const subjectRaw = String(source.subject ?? '').trim()
+  if (/^(fwd|fw|re)\s*:/i.test(subjectRaw))
+    throw new ResponseWorkflowError('WRONG_RECIPIENT', 'source message is a forward or reply, not an original Dunkin message')
+
+  const body = action.contentRef ?? ''
+  if (!body.trim())
+    throw new ResponseWorkflowError('INVALID_TRANSITION', 'approved response has no body to send')
+
+  const now = new Date().toISOString()
+  const message = {
+    id: String(source.gmail_message_id),
+    threadId: String(source.gmail_thread_id),
+    internalDate: String(source.internal_date),
+    sender: String(source.sender),
+    recipients: String(source.recipients),
+    subject: String(source.subject),
+    textBody: '',
+  }
+
+  try {
+    await input.emailProvider.sendAcknowledgment(message, body)
+  } catch (error) {
+    // Ambiguous: Graph may have accepted. Mark NEEDS_RECONCILIATION, never auto-retry.
+    const code = error instanceof Error ? error.message : 'AMBIGUOUS_SEND'
+    await db
+      .prepare(`UPDATE response_actions SET policy_state='NEEDS_RECONCILIATION',updated_at=? WHERE id=?`)
+      .bind(now, input.id)
+      .run()
+    throw new ResponseWorkflowError('AMBIGUOUS_SEND', `send outcome uncertain: ${code}`)
+  }
+
+  // Success: mark SENT.
+  await db
+    .prepare(`UPDATE response_actions SET policy_state='SENT',updated_at=? WHERE id=?`)
+    .bind(now, input.id)
+    .run()
+  const updated = await db
+    .prepare('SELECT * FROM response_actions WHERE id=?')
+    .bind(input.id)
+    .first<Record<string, unknown>>()
+  return toAction(updated!)
 }
 
 export async function getResponseAction(db: D1Database, id: string): Promise<ResponseAction | null> {

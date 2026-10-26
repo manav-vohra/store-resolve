@@ -203,34 +203,54 @@ describe('response action lifecycle', () => {
 })
 
 describe('sendResponseAction', () => {
-  it('throws SEND_DISABLED when the ack flag is off (the default)', async () => {
+  const fakeProvider = {
+    sendAcknowledgment: async () => undefined,
+  }
+
+  it('throws NOT_APPROVED for drafts (approval gate, not the global switch)', async () => {
     const database = db()
     const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'x' })
     await expect(
-      sendResponseAction(database, { id: draft.id, emailAckEnabled: false }),
-    ).rejects.toMatchObject({ code: 'SEND_DISABLED' })
+      sendResponseAction(database, {
+        id: draft.id,
+        emailProvider: fakeProvider,
+        mailboxIdentityVerified: true,
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_APPROVED' })
   })
 
-  it('throws SEND_NOT_WIRED even when the flag is on: Phase C never sends', async () => {
+  it('throws MAILBOX_NOT_VERIFIED when identity is not verified', async () => {
     const database = db()
     const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'x' })
+    await submitResponseForApproval(database, draft.id)
+    await approveResponseAction(database, { id: draft.id, approvedBy: 'dad' })
     await expect(
-      sendResponseAction(database, { id: draft.id, emailAckEnabled: true }),
-    ).rejects.toMatchObject({ code: 'SEND_NOT_WIRED' })
+      sendResponseAction(database, {
+        id: draft.id,
+        emailProvider: fakeProvider,
+        mailboxIdentityVerified: false,
+      }),
+    ).rejects.toMatchObject({ code: 'MAILBOX_NOT_VERIFIED' })
   })
 
   it('throws ACTION_NOT_FOUND for unknown actions', async () => {
     await expect(
-      sendResponseAction(db(), { id: 'nope', emailAckEnabled: false }),
+      sendResponseAction(db(), {
+        id: 'nope',
+        emailProvider: fakeProvider,
+        mailboxIdentityVerified: true,
+      }),
     ).rejects.toMatchObject({ code: 'ACTION_NOT_FOUND' })
   })
 
   it('is a ResponseWorkflowError (never a raw send attempt)', async () => {
     const database = db()
     const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'x' })
-    const error = await sendResponseAction(database, { id: draft.id, emailAckEnabled: false }).catch(
-      (e) => e,
-    )
+    const error = await sendResponseAction(database, {
+      id: draft.id,
+      emailProvider: fakeProvider,
+      mailboxIdentityVerified: true,
+    }).catch((e) => e)
     expect(error).toBeInstanceOf(ResponseWorkflowError)
   })
 })

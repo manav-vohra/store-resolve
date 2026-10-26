@@ -1562,16 +1562,42 @@ app.post('/api/response-actions/:id/reject', async (c) => {
 app.post('/api/response-actions/:id/send', async (c) => {  const user = c.get('user')
   if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
   const state = await loadState(c.env.DB)
+  // Dad-approved sends are gated by APPROVED state + mailbox identity, NOT
+  // by the global email_ack_enabled switch (which stays OFF).
+  if (state.config.mode !== 'FAMILY_PILOT' || state.config.externalNotificationsEnabled)
+    return c.json(jsonError('Production safety controls must remain locked down'), 409)
+  const graph = emailProvider(c.env)
+  if (!graph.ready) return c.json(jsonError('MS_GRAPH_NOT_CONFIGURED'), 503)
+  if (typeof graph.verifyMailboxIdentity !== 'function')
+    return c.json(jsonError('MAILBOX_IDENTITY_NOT_SUPPORTED'), 503)
+  let identity: { matches: boolean; reason: string | null }
   try {
-    await sendResponseAction(c.env.DB, {
+    identity = await graph.verifyMailboxIdentity(c.env.MS_MAILBOX_ADDRESS)
+  } catch (error) {
+    const code = error instanceof EmailProviderError ? error.code : 'MAILBOX_IDENTITY_FAILED'
+    return c.json(jsonError(code), 503)
+  }
+  if (!identity.matches)
+    return c.json(jsonError(`Mailbox identity mismatch: ${identity.reason ?? 'UNKNOWN'}`), 409)
+  try {
+    const action = await sendResponseAction(c.env.DB, {
       id: c.req.param('id'),
-      emailAckEnabled: state.config.emailAckEnabled === true,
+      emailProvider: graph as unknown as Parameters<typeof sendResponseAction>[1]['emailProvider'],
+      mailboxIdentityVerified: true,
     })
-    return c.json({ ok: true })
+    await auditAdminChange(c.env.DB, 'RESPONSE_SENT', action.complaintId, user.id)
+    return c.json({ ok: true, action })
   } catch (error) {
     if (error instanceof ResponseWorkflowError) {
-      const status = error.code === 'SEND_DISABLED' ? 403 : error.code === 'ACTION_NOT_FOUND' ? 404 : 409
-      return c.json(jsonError(error.code), status as 403 | 404 | 409)
+      const status =
+        error.code === 'ACTION_NOT_FOUND'
+          ? 404
+          : error.code === 'NOT_APPROVED' || error.code === 'MAILBOX_NOT_VERIFIED'
+            ? 409
+            : error.code === 'ALREADY_SENT'
+              ? 409
+              : 400
+      return c.json(jsonError(error.code), status as 400 | 404 | 409)
     }
     throw error
   }
