@@ -14,6 +14,7 @@ import {
   renderTemplate,
   sendResponseAction,
   submitResponseForApproval,
+  updateResponseDraft,
 } from '../worker/response-workflow'
 
 class FakeStatement implements D1PreparedStatement {
@@ -34,7 +35,10 @@ class FakeStatement implements D1PreparedStatement {
   }
   async run(): Promise<D1Result> {
     this.db.run(this.sql, this.values)
-    return { results: [], success: true, meta: { changes: 1 } }
+    const changes = (this.db as unknown as { lastChanges?: number }).lastChanges
+    // Reset the marker so unrelated runs default to 1.
+    if (changes !== undefined) (this.db as unknown as { lastChanges?: number }).lastChanges = undefined
+    return { results: [], success: true, meta: { changes: changes ?? 1 } }
   }
 }
 
@@ -58,6 +62,23 @@ class FakeDb implements D1Database {
       return this.templates.get(String(values[0])) ?? null
     if (sql.includes('FROM response_actions WHERE id=?'))
       return this.actions.get(String(values[0])) ?? null
+    if (sql.includes('FROM gmail_messages')) {
+      // Fake Dunkin corporate source for complaint c1.
+      if (String(values[0]) === 'c1')
+        return {
+          gmail_message_id: 'msg-1',
+          gmail_thread_id: 'thread-1',
+          internal_date: '2026-01-01T00:00:00Z',
+          sender: 'Dunkin <cases@dunkinbrands.com>',
+          recipients: 'bvohra@msn.com',
+          subject: 'Complaint CCC123',
+        }
+      return null
+    }
+    if (sql.includes('SELECT policy_state FROM response_actions WHERE id=?')) {
+      const action = this.actions.get(String(values[0]))
+      return action ? { policy_state: action.policy_state } : null
+    }
     return null
   }
   all(sql: string, values: unknown[]): unknown[] {
@@ -94,6 +115,43 @@ class FakeDb implements D1Database {
           action.approved_at = values[3]
         }
         action.updated_at = values[4]
+      }
+    }
+    if (sql.includes(`UPDATE response_actions SET policy_state='SENDING'`)) {
+      // Atomic claim: (now, id) — only if currently APPROVED.
+      const action = this.actions.get(String(values[1]))
+      if (action && action.policy_state === 'APPROVED') {
+        action.policy_state = 'SENDING'
+        action.updated_at = values[0]
+        // Signal 1 change via a marker the FakeStatement can read.
+        ;(this as unknown as { lastChanges: number }).lastChanges = 1
+      } else {
+        ;(this as unknown as { lastChanges: number }).lastChanges = 0
+      }
+    }
+    if (sql.includes(`UPDATE response_actions SET policy_state='SENT'`)) {
+      const action = this.actions.get(String(values[1]))
+      if (action) {
+        action.policy_state = 'SENT'
+        action.updated_at = values[0]
+      }
+    }
+    if (sql.includes(`UPDATE response_actions SET policy_state='NEEDS_RECONCILIATION'`)) {
+      const action = this.actions.get(String(values[1]))
+      if (action) {
+        action.policy_state = 'NEEDS_RECONCILIATION'
+        action.updated_at = values[0]
+      }
+    }
+    if (sql.includes('UPDATE response_actions SET content_ref=?')) {
+      // (body, now, id) — only if DRAFT.
+      const action = this.actions.get(String(values[2]))
+      if (action && action.policy_state === 'DRAFT') {
+        action.content_ref = values[0]
+        action.updated_at = values[1]
+        ;(this as unknown as { lastChanges: number }).lastChanges = 1
+      } else {
+        ;(this as unknown as { lastChanges: number }).lastChanges = 0
       }
     }
   }
@@ -252,5 +310,49 @@ describe('sendResponseAction', () => {
       mailboxIdentityVerified: true,
     }).catch((e) => e)
     expect(error).toBeInstanceOf(ResponseWorkflowError)
+  })
+})
+
+describe('updateResponseDraft', () => {
+  it('edits a DRAFT body', async () => {
+    const database = db()
+    const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'original' })
+    const updated = await updateResponseDraft(database, { id: draft.id, body: 'edited' })
+    expect(updated.contentRef).toBe('edited')
+    expect(updated.policyState).toBe('DRAFT')
+  })
+
+  it('refuses to edit a non-DRAFT action', async () => {
+    const database = db()
+    const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'x' })
+    await submitResponseForApproval(database, draft.id)
+    await expect(
+      updateResponseDraft(database, { id: draft.id, body: 'y' }),
+    ).rejects.toMatchObject({ code: 'INVALID_TRANSITION' })
+  })
+})
+
+describe('sendResponseAction atomic claim', () => {
+  it('second concurrent send loses the race (ALREADY_SENT)', async () => {
+    const database = db()
+    const draft = await createResponseDraft(database, { complaintId: 'c1', body: 'resolution text' })
+    await submitResponseForApproval(database, draft.id)
+    await approveResponseAction(database, { id: draft.id, approvedBy: 'dad' })
+    const provider = { sendAcknowledgment: async () => undefined }
+    // First send wins.
+    const sent = await sendResponseAction(database, {
+      id: draft.id,
+      emailProvider: provider,
+      mailboxIdentityVerified: true,
+    })
+    expect(sent.policyState).toBe('SENT')
+    // Second send is refused — never a duplicate.
+    await expect(
+      sendResponseAction(database, {
+        id: draft.id,
+        emailProvider: provider,
+        mailboxIdentityVerified: true,
+      }),
+    ).rejects.toMatchObject({ code: 'ALREADY_SENT' })
   })
 })

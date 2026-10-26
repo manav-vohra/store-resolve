@@ -54,10 +54,12 @@ import {
   approveResponseAction,
   createResponseDraft,
   createResponseTemplate,
+  listResponseActionsForComplaint,
   listResponseTemplates,
   rejectResponseAction,
   sendResponseAction,
   submitResponseForApproval,
+  updateResponseDraft,
 } from './response-workflow'
 import { buildReport } from './reporting'
 
@@ -1523,6 +1525,40 @@ app.post(
     }
   },
 )
+
+app.get('/api/complaints/:id/response-actions', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const actions = await listResponseActionsForComplaint(c.env.DB, c.req.param('id'))
+  return c.json({ ok: true, actions })
+})
+
+app.patch('/api/response-actions/:id', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json(jsonError('Invalid JSON'), 400)
+  }
+  const parsed = z.object({ body: z.string().min(1) }).safeParse(body)
+  if (!parsed.success) return c.json(jsonError('Body text is required'), 400)
+  try {
+    const action = await updateResponseDraft(c.env.DB, {
+      id: c.req.param('id'),
+      body: parsed.data.body,
+    })
+    return c.json({ ok: true, action })
+  } catch (error) {
+    if (error instanceof ResponseWorkflowError)
+      return c.json(
+        jsonError(error.code),
+        error.code === 'ACTION_NOT_FOUND' ? 404 : 400,
+      )
+    throw error
+  }
+})
 
 app.post('/api/response-actions/:id/submit', async (c) => {
   const user = c.get('user')

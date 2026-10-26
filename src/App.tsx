@@ -31,6 +31,7 @@ import {
 import ReviewQueue from './ReviewQueue'
 import { CheckMailNow } from './components/CheckMailNow'
 import { ManualAck } from './components/ManualAck'
+import { ResponseComposer } from './components/ResponseComposer'
 import { fixtures, initialState } from './lib/seed'
 import type { AppState, Complaint, IntegrationHealth, NewComplaint, Severity } from './lib/types'
 
@@ -1007,6 +1008,10 @@ function ComplaintDetail({
             complaintId={c.id}
             source={c.source}
             acknowledgementStatus={c.acknowledgementStatus}
+            isOwner={current.role === 'OWNER' || current.role === 'ADMIN'}
+          />
+          <ResponseComposer
+            complaintId={c.id}
             isOwner={current.role === 'OWNER' || current.role === 'ADMIN'}
           />
           {!c.storeId && (

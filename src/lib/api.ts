@@ -222,6 +222,62 @@ export const api = {
       z.object({ ok: z.boolean(), result: z.string() }),
       { method: 'POST', body: JSON.stringify(body) },
     ),
+  listResponseActions: (complaintId: string) =>
+    request(
+      `/complaints/${encodeURIComponent(complaintId)}/response-actions`,
+      z.object({
+        ok: z.literal(true),
+        actions: z.array(
+          z.object({
+            id: z.string(),
+            complaintId: z.string(),
+            responseKind: z.string(),
+            policyState: z.string(),
+            contentRef: z.string().optional(),
+            approvedBy: z.string().optional(),
+            approvedAt: z.string().optional(),
+            createdAt: z.string(),
+            updatedAt: z.string(),
+          }),
+        ),
+      }),
+    ),
+  createResponseDraft: (complaintId: string, body: { body: string; responseKind?: string }) =>
+    request(
+      `/complaints/${encodeURIComponent(complaintId)}/response-drafts`,
+      z.object({ ok: z.literal(true), draft: z.object({ id: z.string() }).passthrough() }),
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  updateResponseDraft: (id: string, body: string) =>
+    request(
+      `/response-actions/${encodeURIComponent(id)}`,
+      z.object({ ok: z.literal(true), action: z.object({ id: z.string() }).passthrough() }),
+      { method: 'PATCH', body: JSON.stringify({ body }) },
+    ),
+  submitResponseAction: (id: string) =>
+    request(
+      `/response-actions/${encodeURIComponent(id)}/submit`,
+      z.object({ ok: z.literal(true) }),
+      { method: 'POST' },
+    ),
+  approveResponseAction: (id: string) =>
+    request(
+      `/response-actions/${encodeURIComponent(id)}/approve`,
+      z.object({ ok: z.literal(true) }),
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+  rejectResponseAction: (id: string) =>
+    request(
+      `/response-actions/${encodeURIComponent(id)}/reject`,
+      z.object({ ok: z.literal(true) }),
+      { method: 'POST' },
+    ),
+  sendResponseAction: (id: string) =>
+    request(
+      `/response-actions/${encodeURIComponent(id)}/send`,
+      z.object({ ok: z.literal(true) }),
+      { method: 'POST' },
+    ),
   importPreviewMail: (body: {
     messageIds: string[]
     receivedStart: string

@@ -26,6 +26,7 @@ export type ResponseActionPolicyState =
   | 'REJECTED'
   | 'SEND_BLOCKED'
   | 'SENT'
+  | 'SENDING'
   | 'SEND_FAILED'
   | 'NEEDS_RECONCILIATION'
 
@@ -294,6 +295,8 @@ export async function sendResponseAction(
     throw new ResponseWorkflowError('MAILBOX_NOT_VERIFIED', 'mailbox identity must be verified before sending')
 
   // Load the complaint's original source message for recipient safety + thread.
+  // All validation happens BEFORE the atomic claim, so a refused send never
+  // leaves the action stuck in SENDING.
   const source = await db
     .prepare(
       `SELECT gm.* FROM gmail_messages gm WHERE gm.complaint_id=? AND gm.is_follow_up=0 ORDER BY gm.first_seen_at LIMIT 1`,
@@ -321,7 +324,34 @@ export async function sendResponseAction(
   if (!body.trim())
     throw new ResponseWorkflowError('INVALID_TRANSITION', 'approved response has no body to send')
 
+  // ATOMIC CLAIM: transition APPROVED -> SENDING in a single conditional
+  // UPDATE. Only one caller can win the claim; repeated taps or concurrent
+  // requests that lose the race see the action is no longer APPROVED and
+  // refuse to send. This is the duplicate-send guard.
   const now = new Date().toISOString()
+  const claim = await db
+    .prepare(
+      `UPDATE response_actions SET policy_state='SENDING',updated_at=? WHERE id=? AND policy_state='APPROVED'`,
+    )
+    .bind(now, input.id)
+    .run()
+  if ((claim.meta?.changes ?? 0) === 0) {
+    // Lost the race (or state changed). Re-read to report accurately.
+    const current = await db
+      .prepare('SELECT policy_state FROM response_actions WHERE id=?')
+      .bind(input.id)
+      .first<{ policy_state: string }>()
+    const state = current?.policy_state ?? 'UNKNOWN'
+    if (state === 'SENT' || state === 'SENDING')
+      throw new ResponseWorkflowError('ALREADY_SENT', `response action ${input.id} is already ${state}`)
+    if (state === 'NEEDS_RECONCILIATION')
+      throw new ResponseWorkflowError(
+        'AMBIGUOUS_SEND',
+        `response action ${input.id} has an uncertain send outcome — check Sent Items before retrying`,
+      )
+    throw new ResponseWorkflowError('NOT_APPROVED', `response action ${input.id} is ${state}, not APPROVED`)
+  }
+
   const message = {
     id: String(source.gmail_message_id),
     threadId: String(source.gmail_thread_id),
@@ -373,4 +403,37 @@ export async function listResponseActionsForComplaint(
     .bind(complaintId)
     .all<Record<string, unknown>>()
   return rows.results.map(toAction)
+}
+
+/**
+ * Edit a DRAFT's body. Only DRAFT actions can be edited — once submitted
+ * for approval, the text is frozen to preserve the review chain.
+ */
+export async function updateResponseDraft(
+  db: D1Database,
+  input: { id: string; body: string },
+): Promise<ResponseAction> {
+  const now = new Date().toISOString()
+  const result = await db
+    .prepare(
+      `UPDATE response_actions SET content_ref=?,updated_at=? WHERE id=? AND policy_state='DRAFT'`,
+    )
+    .bind(input.body, now, input.id)
+    .run()
+  if ((result.meta?.changes ?? 0) === 0) {
+    const row = await db
+      .prepare('SELECT policy_state FROM response_actions WHERE id=?')
+      .bind(input.id)
+      .first<{ policy_state: string }>()
+    if (!row) throw new ResponseWorkflowError('ACTION_NOT_FOUND', `response action ${input.id} not found`)
+    throw new ResponseWorkflowError(
+      'INVALID_TRANSITION',
+      `cannot edit response action ${input.id} in state ${row.policy_state} (only DRAFT can be edited)`,
+    )
+  }
+  const updated = await db
+    .prepare('SELECT * FROM response_actions WHERE id=?')
+    .bind(input.id)
+    .first<Record<string, unknown>>()
+  return toAction(updated!)
 }
