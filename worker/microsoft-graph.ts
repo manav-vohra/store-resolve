@@ -154,8 +154,9 @@ export function validateGraphRequestUrl(path: string): string {
   if (path.startsWith('/')) {
     if (path.includes('..') || path.includes('\\'))
       throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request path is invalid')
-    // Permit exactly /me (identity lookup) and /me/... (mailbox scope).
-    if (path !== '/me' && !path.startsWith('/me/'))
+    // Permit exactly /me (identity lookup, with optional query string) and /me/... (mailbox scope).
+    const pathWithoutQuery = path.split('?')[0]
+    if (pathWithoutQuery !== '/me' && !pathWithoutQuery.startsWith('/me/'))
       throw new EmailProviderError('MS_GRAPH_INVALID_URL', 'Graph request must target /me/')
     return `${GRAPH_ROOT}${path}`
   }
