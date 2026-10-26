@@ -126,7 +126,7 @@ export function ResponseComposer({
       case 'DRAFT': return 'Draft — not yet submitted'
       case 'PENDING_APPROVAL': return 'Waiting for approval'
       case 'APPROVED': return 'Approved — ready to send'
-      case 'SENT': return 'Sent to Dunkin'
+      case 'SENT': return 'Accepted by Microsoft Graph'
       case 'SENDING': return 'Sending… (do not tap again)'
       case 'REJECTED': return 'Rejected — will not be sent'
       case 'NEEDS_RECONCILIATION': return 'Uncertain delivery — check Sent Items before retrying'
@@ -226,7 +226,7 @@ export function ResponseComposer({
                 </button>
               )}
               {a.policyState === 'SENT' && (
-                <p style={{ color: 'green' }}>✓ Delivered — no second send will occur.</p>
+                <p style={{ color: 'green' }}>✓ Accepted by Microsoft Graph — reply submitted to the original thread. Graph acceptance does not prove the recipient opened it.</p>
               )}
               {a.policyState === 'NEEDS_RECONCILIATION' && (
                 <p style={{ color: '#b00' }}>
