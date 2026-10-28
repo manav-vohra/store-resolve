@@ -278,11 +278,11 @@ export const api = {
       z.object({ ok: z.literal(true) }),
       { method: 'POST' },
     ),
-  notifyDraftReady: (id: string) =>
+  notifyDraftReady: (id: string, force = false) =>
     request(
       `/admin/notify-draft-ready/${encodeURIComponent(id)}`,
       z.object({ ok: z.literal(true), sent: z.boolean(), reason: z.string().optional() }),
-      { method: 'POST' },
+      { method: 'POST', body: JSON.stringify({ force }) },
     ),
   importPreviewMail: (body: {
     messageIds: string[]

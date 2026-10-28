@@ -1526,10 +1526,18 @@ app.post(
 )
 
 // One-time / manual draft-ready notification for an existing draft.
-// Owner-only. Idempotent: a draft already push-notified (SENT) is skipped.
+// Owner-only. Idempotent: a draft already push-notified (SENT) is skipped
+// unless {"force": true} is passed (explicit admin re-notify).
 app.post('/api/admin/notify-draft-ready/:draftId', async (c) => {
   const user = c.get('user')
   if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  let force = false
+  try {
+    const body = await c.req.json().catch(() => null) as { force?: boolean } | null
+    force = body?.force === true
+  } catch {
+    // No body is fine — defaults to non-force.
+  }
   const draft = await c.env.DB
     .prepare('SELECT id, complaint_id, policy_state FROM response_actions WHERE id=?')
     .bind(c.req.param('draftId'))
@@ -1547,7 +1555,7 @@ app.post('/api/admin/notify-draft-ready/:draftId', async (c) => {
     id: draft.id,
     complaintId: draft.complaint_id,
     externalCaseId: complaint.external_case_id,
-  })
+  }, { force })
   return c.json({ ok: true, ...result })
 })
 

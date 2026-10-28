@@ -35,6 +35,7 @@ export function ResponseComposer({
   const [editBody, setEditBody] = useState('')
   const [sendingId, setSendingId] = useState<string | null>(null)
   const [notifyMsg, setNotifyMsg] = useState<string | null>(null)
+  const [alreadyNotifiedId, setAlreadyNotifiedId] = useState<string | null>(null)
 
   async function load() {
     setLoading(true)
@@ -122,14 +123,17 @@ export function ResponseComposer({
     }
   }
 
-  async function notifyDad(id: string) {
+  async function notifyDad(id: string, force = false) {
     setLoading(true)
     setError(null)
     setNotifyMsg(null)
+    setAlreadyNotifiedId(null)
     try {
-      const res = await api.notifyDraftReady(id)
+      const res = await api.notifyDraftReady(id, force)
       if (res.sent) {
         setNotifyMsg('Dad notified — push sent to his iPhone.')
+      } else if (res.reason === 'ALREADY_SENT' && !force) {
+        setAlreadyNotifiedId(id)
       } else {
         setError(`Notification not sent: ${res.reason ?? 'unknown'}`)
       }
@@ -227,6 +231,11 @@ export function ResponseComposer({
                   <button className="secondary" onClick={() => notifyDad(a.id)} disabled={loading}>
                     Notify Dad
                   </button>
+                  {alreadyNotifiedId === a.id && (
+                    <button className="secondary" onClick={() => notifyDad(a.id, true)} disabled={loading}>
+                      Notify again
+                    </button>
+                  )}
                 </>
               )}
               {a.policyState === 'PENDING_APPROVAL' && (

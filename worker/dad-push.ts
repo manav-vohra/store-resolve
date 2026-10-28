@@ -358,6 +358,7 @@ export async function notifyDadDraftReady(
   db: D1Database,
   env: DadPushEnv,
   draft: { id: string; complaintId: string; externalCaseId: string },
+  opts?: { force?: boolean },
 ): Promise<{ sent: boolean; reason?: string }> {
   const now = new Date().toISOString()
   try {
@@ -371,14 +372,17 @@ export async function notifyDadDraftReady(
       .first<{ value: string }>()
     if (mode?.value !== 'FAMILY_PILOT') return { sent: false, reason: 'NOT_FAMILY_PILOT' }
 
-    // Idempotency: one push per draft, ever. Edits do not re-notify.
-    const existing = await db
-      .prepare(
-        `SELECT id FROM notifications WHERE event_type='DRAFT_READY' AND provider_message_id=? AND channel='PUSH' AND status='SENT'`,
-      )
-      .bind(draft.id)
-      .first<{ id: string }>()
-    if (existing) return { sent: false, reason: 'ALREADY_SENT' }
+    // Idempotency: one push per draft, ever — unless force is set (explicit
+    // admin re-notify, e.g. Dad missed the first one). Edits never re-notify.
+    if (!opts?.force) {
+      const existing = await db
+        .prepare(
+          `SELECT id FROM notifications WHERE event_type='DRAFT_READY' AND provider_message_id=? AND channel='PUSH' AND status='SENT'`,
+        )
+        .bind(draft.id)
+        .first<{ id: string }>()
+      if (existing) return { sent: false, reason: 'ALREADY_SENT' }
+    }
 
     const sub = await db
       .prepare(
