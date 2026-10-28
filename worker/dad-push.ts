@@ -346,9 +346,24 @@ export async function retryFailedDadPushes(
  * Dad-only draft-ready push notification.
  *
  * Fires once per response draft, when a reply is prepared for Dad's review.
- * Edits never re-notify: dedup is by (event_type='DRAFT_READY', draft id
- * stored in provider_message_id). A SENT record for the draft blocks any
- * second push, even if the draft is edited, resubmitted, or re-approved.
+ * Edits never re-notify: a confirmed SENT record for the draft blocks any
+ * second push, even if the draft is edited, resubmitted, or re-approved,
+ * unless force is set (explicit admin re-notify, e.g. Dad missed the
+ * first one).
+ *
+ * Audit model (fixed 2026-10-27): every attempt gets its OWN row.
+ * provider_message_id is `${draftId}:${attemptUuid}` — never the bare
+ * draft id — because migration 0002 puts a UNIQUE index on
+ * provider_message_id, and the old bare-draft-id value made the second
+ * attempt's audit INSERT fail (the Oct 27 re-notify reached Apple but
+ * left no audit row). The dedup check below matches both the legacy
+ * bare-draft-id row and per-attempt rows. Draft ids are UUIDs (no LIKE
+ * wildcards), so the prefix match is exact.
+ *
+ * Attempt lifecycle: the row is INSERTed as PENDING *before* the push
+ * service is called, then UPDATED in place with the actual outcome, so
+ * a send is never untracked — a crash mid-send leaves a PENDING row
+ * instead of silence.
  *
  * Same gates as new-complaint pushes: dad_push_enabled kill switch,
  * FAMILY_PILOT mode, active subscription, Web Push configured. Never
@@ -361,6 +376,9 @@ export async function notifyDadDraftReady(
   opts?: { force?: boolean },
 ): Promise<{ sent: boolean; reason?: string }> {
   const now = new Date().toISOString()
+  // Set once the PENDING attempt row exists, so the outer catch can
+  // settle it instead of inserting a second row.
+  let attemptId: string | null = null
   try {
     const pushSwitch = await db
       .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
@@ -372,14 +390,15 @@ export async function notifyDadDraftReady(
       .first<{ value: string }>()
     if (mode?.value !== 'FAMILY_PILOT') return { sent: false, reason: 'NOT_FAMILY_PILOT' }
 
-    // Idempotency: one push per draft, ever — unless force is set (explicit
-    // admin re-notify, e.g. Dad missed the first one). Edits never re-notify.
+    // Idempotency: a confirmed SENT blocks a second push — unless force
+    // is set (explicit admin re-notify). Matches the legacy bare-draft-id
+    // row as well as per-attempt rows.
     if (!opts?.force) {
       const existing = await db
         .prepare(
-          `SELECT id FROM notifications WHERE event_type='DRAFT_READY' AND provider_message_id=? AND channel='PUSH' AND status='SENT'`,
+          `SELECT id FROM notifications WHERE event_type='DRAFT_READY' AND channel='PUSH' AND status='SENT' AND (provider_message_id=? OR provider_message_id LIKE ?)`,
         )
-        .bind(draft.id)
+        .bind(draft.id, `${draft.id}:%`)
         .first<{ id: string }>()
       if (existing) return { sent: false, reason: 'ALREADY_SENT' }
     }
@@ -401,6 +420,44 @@ export async function notifyDadDraftReady(
       return { sent: false, reason: 'WEBPUSH_NOT_READY' }
     }
 
+    // Record the attempt BEFORE calling the push service.
+    attemptId = crypto.randomUUID()
+    const attemptKey = `${draft.id}:${attemptId}`
+    await db
+      .prepare(
+        `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .bind(
+        attemptId,
+        draft.complaintId,
+        'DRAFT_READY',
+        DAD_USER_ID,
+        'PUSH',
+        `Reply ready for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+        'PENDING',
+        'WEBPUSH',
+        attemptKey,
+        now,
+        null,
+        null,
+        null,
+      )
+      .run()
+
+    const settle = (status: 'SENT' | 'FAILED' | 'NEEDS_RECONCILIATION', reason: string | null) =>
+      db
+        .prepare(
+          `UPDATE notifications SET status=?, sent_at=?, failed_at=?, failure_reason=? WHERE id=?`,
+        )
+        .bind(
+          status,
+          status === 'SENT' ? now : null,
+          status === 'FAILED' ? now : null,
+          reason,
+          attemptId,
+        )
+        .run()
+
     try {
       const result = await push.sendToSubscription(
         { endpoint: sub.endpoint, p256dhKey: sub.p256dh_key, authKey: sub.auth_key },
@@ -411,25 +468,34 @@ export async function notifyDadDraftReady(
           .prepare(`UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND revoked_at IS NULL`)
           .bind(now, sub.endpoint)
           .run()
-        await recordDraft(db, draft, 'FAILED', 'SUBSCRIPTION_EXPIRED', now)
+        await settle('FAILED', 'SUBSCRIPTION_EXPIRED')
         return { sent: false, reason: 'SUBSCRIPTION_EXPIRED' }
       }
       await db
         .prepare(`UPDATE push_subscriptions SET last_used_at=? WHERE endpoint=?`)
         .bind(now, sub.endpoint)
         .run()
-      await recordDraft(db, draft, 'SENT', null, now)
+      await settle('SENT', null)
       return { sent: true }
     } catch (error) {
       const msg = (error as Error).message
       const uncertain = /timeout|timed out|5\d\d|network|econn|socket|abort/i.test(msg)
       const status = uncertain ? 'NEEDS_RECONCILIATION' : 'FAILED'
-      await recordDraft(db, draft, status, msg.slice(0, 500), now)
+      await settle(status, msg.slice(0, 500))
       return { sent: false, reason: uncertain ? 'SEND_UNCERTAIN' : 'SEND_FAILED' }
     }
   } catch (error) {
     try {
-      await recordDraft(db, draft, 'FAILED', `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, now)
+      if (attemptId) {
+        // The PENDING row exists: settle it so the attempt is not left
+        // untracked, instead of inserting a second row.
+        await db
+          .prepare(`UPDATE notifications SET status='FAILED', failed_at=?, failure_reason=? WHERE id=?`)
+          .bind(now, `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, attemptId)
+          .run()
+      } else {
+        await recordDraft(db, draft, 'FAILED', `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, now)
+      }
     } catch {
       // Even the audit write failed; nothing more we can do.
     }
@@ -444,6 +510,9 @@ async function recordDraft(
   reason: string | null,
   now: string,
 ): Promise<void> {
+  // Per-attempt key: the UNIQUE index on provider_message_id (migration
+  // 0002) forbids two rows sharing a key, so the bare draft id must never
+  // be reused across attempts.
   await db
     .prepare(
       `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -457,7 +526,7 @@ async function recordDraft(
       `Reply ready for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
       status,
       'WEBPUSH',
-      draft.id,
+      `${draft.id}:${crypto.randomUUID()}`,
       now,
       status === 'SENT' ? now : null,
       status === 'FAILED' ? now : null,

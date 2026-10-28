@@ -137,7 +137,10 @@ export function ResponseComposer({
       } else {
         setError(`Notification not sent: ${res.reason ?? 'unknown'}`)
       }
-      await load()
+      // No load() here on purpose: notifying does not change the action
+      // list, and load() clears error state — which previously wiped the
+      // notify failure message before anyone could read it (Oct 27).
+      // Success and error messages above must stay visible.
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Notify failed')
     } finally {
