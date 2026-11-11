@@ -1590,6 +1590,32 @@ app.get('/api/complaints/:id/response-actions', async (c) => {
   return c.json({ ok: true, actions })
 })
 
+// Pending reply drafts, for the dashboard "waiting for review" surface.
+// Owner-only. One targeted query — deliberately NOT part of bootstrap /
+// loadState, so the dashboard banner costs a single row read, not a reload.
+// Only DRAFT actions: submitted, approved, rejected, or sent drafts are
+// no longer waiting on Dad.
+app.get('/api/drafts/pending', async (c) => {
+  const user = c.get('user')
+  if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)
+  const drafts = await c.env.DB
+    .prepare(
+      `SELECT ra.id AS id, ra.complaint_id AS complaintId, c.external_case_id AS externalCaseId,
+              c.category AS category, ra.response_kind AS responseKind, ra.created_at AS createdAt
+       FROM response_actions ra JOIN complaints c ON c.id = ra.complaint_id
+       WHERE ra.policy_state='DRAFT' ORDER BY ra.created_at ASC`,
+    )
+    .all<{
+      id: string
+      complaintId: string
+      externalCaseId: string
+      category: string
+      responseKind: string
+      createdAt: string
+    }>()
+  return c.json({ ok: true, drafts: drafts.results })
+})
+
 app.patch('/api/response-actions/:id', async (c) => {
   const user = c.get('user')
   if (!canAdmin(user)) return c.json(jsonError('Owner access required'), 403)

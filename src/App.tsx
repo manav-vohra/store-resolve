@@ -56,6 +56,29 @@ const fmt = (value?: string) =>
     : '—'
 const cx = (...x: (string | false | undefined)[]) => x.filter(Boolean).join(' ')
 
+// A reply draft still waiting for Dad's review (DRAFT state only), as
+// returned by GET /api/drafts/pending.
+type PendingDraft = {
+  id: string
+  complaintId: string
+  externalCaseId: string
+  category: string
+  responseKind: string
+  createdAt: string
+}
+// Stored timestamps are SQLite `datetime('now')` UTC ("YYYY-MM-DD HH:MM:SS")
+// or ISO; normalize before parsing so "waiting N days" is computed in UTC.
+const daysWaiting = (createdAt: string): string => {
+  const normalized = createdAt.includes('T')
+    ? createdAt
+    : `${createdAt.replace(' ', 'T')}Z`
+  const ms = Date.parse(normalized)
+  if (!Number.isFinite(ms)) return 'waiting for review'
+  const days = Math.max(0, Math.floor((Date.now() - ms) / 86_400_000))
+  if (days === 0) return 'waiting since today'
+  return days === 1 ? 'waiting 1 day' : `waiting ${days} days`
+}
+
 // Deep links: `#/complaints/:id` opens the complaint detail view. Used by Web
 // Push notification taps (`notificationclick` → `clients.openWindow(url)`) and
 // shareable links. The hash keeps the URL stable behind Cloudflare Access and
@@ -94,6 +117,7 @@ export default function App() {
   const [toast, setToast] = useState<string>()
   const [quotaExceeded, setQuotaExceeded] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [pendingDrafts, setPendingDrafts] = useState<PendingDraft[]>([])
   const user = state.users.find((u) => u.id === state.activeUserId)!
   const selected = state.complaints.find((c) => c.id === selectedId)
   const show = (message: string) => {
@@ -203,6 +227,24 @@ export default function App() {
     window.addEventListener('hashchange', openFromHash)
     return () => window.removeEventListener('hashchange', openFromHash)
   }, [loading, state.complaints, user, view, selectedId])
+  // Pending reply drafts for the dashboard banner. Owner/admin only; a
+  // failed fetch just hides the banner — it never breaks the dashboard.
+  // Re-runs whenever the dashboard is shown, so returning from a complaint
+  // refreshes the list.
+  useEffect(() => {
+    if (loading || view !== 'dashboard') return
+    if (user.role !== 'OWNER' && user.role !== 'ADMIN') return
+    let cancelled = false
+    api
+      .listPendingDrafts()
+      .then((result) => {
+        if (!cancelled) setPendingDrafts(result.drafts)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [loading, view, user.role])
   if (loading)
     return (
       <div className="loading-screen">
@@ -329,6 +371,7 @@ export default function App() {
           {view === 'dashboard' && (
             <Dashboard
               state={{ ...state, complaints: visibleComplaints }}
+              pendingDrafts={pendingDrafts}
               onOpen={(id) => navigate('detail', id)}
               onCreate={() => navigate('simulator')}
             />
@@ -534,10 +577,12 @@ function PageTitle({
 
 function Dashboard({
   state,
+  pendingDrafts,
   onOpen,
   onCreate,
 }: {
   state: AppState
+  pendingDrafts: PendingDraft[]
   onOpen: (id: string) => void
   onCreate: () => void
 }) {
@@ -609,6 +654,37 @@ function Dashboard({
           </div>
         ))}
       </section>
+      {pendingDrafts.length > 0 && (
+        <section className="panel attention">
+          <div className="panel-head">
+            <div>
+              <h2>Replies waiting for review</h2>
+              <p>Draft replies to Dunkin — tap one to review, approve, and send.</p>
+            </div>
+          </div>
+          {pendingDrafts.map((d) => (
+            <button
+              className="attention-row"
+              key={d.id}
+              onClick={() => {
+                // Deep link: opens the complaint scrolled to Reply to Dunkin.
+                window.location.hash = `#/complaints/${d.complaintId}/reply`
+              }}
+            >
+              <span className="alert-icon">
+                <Bell />
+              </span>
+              <div>
+                <strong>Reply ready — Case {d.externalCaseId}</strong>
+                <span>
+                  {d.category} · {daysWaiting(d.createdAt)}
+                </span>
+              </div>
+              <ChevronRight />
+            </button>
+          ))}
+        </section>
+      )}
       <section className="split">
         <div className="panel">
           <div className="panel-head">

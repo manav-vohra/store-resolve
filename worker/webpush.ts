@@ -317,6 +317,25 @@ export function buildDraftReadyPushPayload(draft: {
 }
 
 /**
+ * Dad-only draft-reminder push. Fires at most ONCE per draft, when a reply
+ * has sat unreviewed for a week after its first draft-ready push (see
+ * remindStaleDrafts in worker/dad-push.ts). Same deep link as the
+ * draft-ready push; a different tag so it never collapses with the first one.
+ */
+export function buildDraftReminderPushPayload(draft: {
+  id: string
+  complaintId: string
+  externalCaseId: string
+}): WebPushPayload {
+  return {
+    title: 'StoreResolve',
+    body: `Reminder: reply still waiting for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+    url: `/#/complaints/${draft.complaintId}/reply`,
+    tag: `draft-reminder-${draft.id}`,
+  }
+}
+
+/**
  * Send one encrypted push message. Throws on transport/provider errors.
  * A 404/410 resolves to `{expired: true}` instead of throwing so the caller
  * can revoke the subscription.

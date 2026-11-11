@@ -105,6 +105,24 @@ export async function runDadPilotDiscoveryTick(
     .first<{ value: string }>()
   const dadPushOn = pushEnabled?.value === 'true'
 
+  // Stale-draft reminder sweep: one capped re-nudge per draft that has sat
+  // unreviewed for a week after its first draft-ready push. Runs here —
+  // before the Graph gates — because reminders need only D1 + push, not
+  // mailbox access: a Graph outage must not silence them. Never throws
+  // and never blocks discovery; dad_push_enabled is the kill switch.
+  if (dadPushOn) {
+    try {
+      const { remindStaleDrafts } = await import('./dad-push')
+      await remindStaleDrafts(db, {
+        VAPID_PUBLIC_KEY: env.VAPID_PUBLIC_KEY,
+        VAPID_PRIVATE_KEY: env.VAPID_PRIVATE_KEY,
+        PUBLIC_BASE_URL: env.PUBLIC_BASE_URL,
+      })
+    } catch {
+      // Reminder failures are audited inside the sweep; discovery proceeds.
+    }
+  }
+
   // Gate 4: Graph must be configured.
   const provider = new MicrosoftGraphProvider({
     clientId: env.MS_CLIENT_ID ?? '',

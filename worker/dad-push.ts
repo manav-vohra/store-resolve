@@ -15,7 +15,7 @@
  *   push-notified (SENT record exists) is skipped.
  */
 import { WebPushProvider } from './providers'
-import { buildDraftReadyPushPayload, buildNewComplaintPushPayload } from './webpush'
+import { buildDraftReadyPushPayload, buildDraftReminderPushPayload, buildNewComplaintPushPayload } from './webpush'
 import type { D1Database } from './d1'
 
 interface DadPushEnv {
@@ -533,4 +533,272 @@ async function recordDraft(
       reason,
     )
     .run()
+}
+
+/**
+ * Dad-only draft-reminder push: the one capped re-nudge for a reply that
+ * has sat unreviewed after its first draft-ready push.
+ *
+ * Mirrors notifyDadDraftReady's proven pattern (same gates, PENDING row
+ * before the push service is called, settle in place), with two deliberate
+ * differences:
+ * - event_type is 'DRAFT_REMINDER', not 'DRAFT_READY', so the reminder is
+ *   auditable separately from the first notification and from manual
+ *   re-notifies. Dedup is on a SENT DRAFT_REMINDER: at most one reminder
+ *   per draft, ever.
+ * - The message says "Reminder" so Dad can tell it apart from the first
+ *   notice. Same deep link (the complaint's Reply section).
+ *
+ * Kill switch: dad_push_enabled — turning it off stops reminders exactly
+ * like every other Dad push.
+ */
+export async function notifyDadDraftReminder(
+  db: D1Database,
+  env: DadPushEnv,
+  draft: { id: string; complaintId: string; externalCaseId: string },
+): Promise<{ sent: boolean; reason?: string }> {
+  const now = new Date().toISOString()
+  let attemptId: string | null = null
+  try {
+    const pushSwitch = await db
+      .prepare(`SELECT value FROM settings WHERE key='dad_push_enabled'`)
+      .first<{ value: string }>()
+    if (pushSwitch?.value !== 'true') return { sent: false, reason: 'PUSH_DISABLED' }
+
+    const mode = await db
+      .prepare(`SELECT value FROM settings WHERE key='notification_mode'`)
+      .first<{ value: string }>()
+    if (mode?.value !== 'FAMILY_PILOT') return { sent: false, reason: 'NOT_FAMILY_PILOT' }
+
+    // Idempotency: one reminder per draft, ever.
+    const existing = await db
+      .prepare(
+        `SELECT id FROM notifications WHERE event_type='DRAFT_REMINDER' AND channel='PUSH' AND status='SENT' AND provider_message_id LIKE ?`,
+      )
+      .bind(`${draft.id}:%`)
+      .first<{ id: string }>()
+    if (existing) return { sent: false, reason: 'ALREADY_SENT' }
+
+    const sub = await db
+      .prepare(
+        `SELECT endpoint, p256dh_key, auth_key FROM push_subscriptions WHERE user_id=? AND revoked_at IS NULL ORDER BY last_used_at DESC LIMIT 1`,
+      )
+      .bind(DAD_USER_ID)
+      .first<{ endpoint: string; p256dh_key: string; auth_key: string }>()
+    if (!sub) {
+      await recordDraftReminder(db, draft, 'SKIPPED', 'NO_PUSH_SUBSCRIPTION', now)
+      return { sent: false, reason: 'NO_PUSH_SUBSCRIPTION' }
+    }
+
+    const push = webPush(env)
+    if (!push.ready) {
+      await recordDraftReminder(db, draft, 'SKIPPED', 'WEBPUSH_NOT_READY', now)
+      return { sent: false, reason: 'WEBPUSH_NOT_READY' }
+    }
+
+    // Record the attempt BEFORE calling the push service.
+    attemptId = crypto.randomUUID()
+    const attemptKey = `${draft.id}:${attemptId}`
+    await db
+      .prepare(
+        `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .bind(
+        attemptId,
+        draft.complaintId,
+        'DRAFT_REMINDER',
+        DAD_USER_ID,
+        'PUSH',
+        `Reminder: reply still waiting for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+        'PENDING',
+        'WEBPUSH',
+        attemptKey,
+        now,
+        null,
+        null,
+        null,
+      )
+      .run()
+
+    const settle = (status: 'SENT' | 'FAILED' | 'NEEDS_RECONCILIATION', reason: string | null) =>
+      db
+        .prepare(
+          `UPDATE notifications SET status=?, sent_at=?, failed_at=?, failure_reason=? WHERE id=?`,
+        )
+        .bind(
+          status,
+          status === 'SENT' ? now : null,
+          status === 'FAILED' ? now : null,
+          reason,
+          attemptId,
+        )
+        .run()
+
+    try {
+      const result = await push.sendToSubscription(
+        { endpoint: sub.endpoint, p256dhKey: sub.p256dh_key, authKey: sub.auth_key },
+        buildDraftReminderPushPayload(draft),
+      )
+      if (result.expired) {
+        await db
+          .prepare(`UPDATE push_subscriptions SET revoked_at=? WHERE endpoint=? AND revoked_at IS NULL`)
+          .bind(now, sub.endpoint)
+          .run()
+        await settle('FAILED', 'SUBSCRIPTION_EXPIRED')
+        return { sent: false, reason: 'SUBSCRIPTION_EXPIRED' }
+      }
+      await db
+        .prepare(`UPDATE push_subscriptions SET last_used_at=? WHERE endpoint=?`)
+        .bind(now, sub.endpoint)
+        .run()
+      await settle('SENT', null)
+      return { sent: true }
+    } catch (error) {
+      const msg = (error as Error).message
+      const uncertain = /timeout|timed out|5\d\d|network|econn|socket|abort/i.test(msg)
+      const status = uncertain ? 'NEEDS_RECONCILIATION' : 'FAILED'
+      await settle(status, msg.slice(0, 500))
+      return { sent: false, reason: uncertain ? 'SEND_UNCERTAIN' : 'SEND_FAILED' }
+    }
+  } catch (error) {
+    try {
+      if (attemptId) {
+        await db
+          .prepare(`UPDATE notifications SET status='FAILED', failed_at=?, failure_reason=? WHERE id=?`)
+          .bind(now, `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, attemptId)
+          .run()
+      } else {
+        await recordDraftReminder(db, draft, 'FAILED', `DAD_PUSH_ERROR: ${(error as Error).message.slice(0, 300)}`, now)
+      }
+    } catch {
+      // Even the audit write failed; nothing more we can do.
+    }
+    return { sent: false, reason: 'INTERNAL_ERROR' }
+  }
+}
+
+async function recordDraftReminder(
+  db: D1Database,
+  draft: { id: string; complaintId: string; externalCaseId: string },
+  status: 'SENT' | 'FAILED' | 'SKIPPED' | 'NEEDS_RECONCILIATION',
+  reason: string | null,
+  now: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO notifications(id,complaint_id,event_type,recipient_user_id,channel,message,status,provider,provider_message_id,created_at,sent_at,failed_at,failure_reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      draft.complaintId,
+      'DRAFT_REMINDER',
+      DAD_USER_ID,
+      'PUSH',
+      `Reminder: reply still waiting for review — Case ${draft.externalCaseId}. Tap to review and approve.`,
+      status,
+      'WEBPUSH',
+      `${draft.id}:${crypto.randomUUID()}`,
+      now,
+      status === 'SENT' ? now : null,
+      status === 'FAILED' ? now : null,
+      reason,
+    )
+    .run()
+}
+
+/**
+ * Days a draft must sit unreviewed after its first draft-ready push before
+ * the one automatic reminder fires. A week: drafts are rare (one per reply),
+ * Dad's loop is days not hours, and anything shorter would nag.
+ */
+export const STALE_DRAFT_REMINDER_DAYS = 7
+
+/**
+ * Stale-draft reminder sweep, run from the 15-min pilot tick.
+ *
+ * A draft is due for its one reminder when ALL hold:
+ * - still in DRAFT state (not submitted, approved, rejected, or sent);
+ * - exactly ONE DRAFT_READY push was ever confirmed SENT for it, and that
+ *   push is at least STALE_DRAFT_REMINDER_DAYS old;
+ * - no DRAFT_REMINDER has ever been confirmed SENT for it.
+ *
+ * Deliberate boundaries (do not "fix" by widening them without a decision):
+ * - A draft with TWO or more confirmed DRAFT_READY pushes already got a
+ *   manual re-notify (e.g. CCC11703791's Oct 28 force re-notify) — that
+ *   counts as its reminder, so the sweep never sends it a third push.
+ * - A draft with ZERO confirmed pushes is left alone: the initial-notify
+ *   path owns first notifications, and the manual "Notify Dad" button
+ *   covers the rest. The sweep never originates a first notification.
+ * - At most one reminder per draft, ever (enforced by notifyDadDraftReminder's
+ *   dedup and re-checked here so a second tick cannot double-send).
+ *
+ * Bounded (max 10 drafts per tick) and never throws: a bad row is skipped
+ * and counted, and the tick keeps running discovery.
+ */
+export async function remindStaleDrafts(
+  db: D1Database,
+  env: DadPushEnv,
+  opts?: { nowMs?: number },
+): Promise<{ checked: number; reminded: number; skipped: number }> {
+  const out = { checked: 0, reminded: 0, skipped: 0 }
+  const nowMs = opts?.nowMs ?? Date.now()
+  const staleBeforeMs = nowMs - STALE_DRAFT_REMINDER_DAYS * 24 * 60 * 60 * 1000
+  try {
+    const drafts = await db
+      .prepare(
+        `SELECT ra.id, ra.complaint_id, c.external_case_id
+         FROM response_actions ra JOIN complaints c ON c.id = ra.complaint_id
+         WHERE ra.policy_state='DRAFT' ORDER BY ra.created_at ASC LIMIT 10`,
+      )
+      .all<{ id: string; complaint_id: string; external_case_id: string }>()
+    for (const draft of drafts.results) {
+      out.checked += 1
+      try {
+        // How many first-notices were confirmed, and when was the latest?
+        const ready = await db
+          .prepare(
+            `SELECT COUNT(*) AS n, MAX(sent_at) AS latest FROM notifications
+             WHERE event_type='DRAFT_READY' AND channel='PUSH' AND status='SENT'
+             AND (provider_message_id=? OR provider_message_id LIKE ?)`,
+          )
+          .bind(draft.id, `${draft.id}:%`)
+          .first<{ n: number; latest: string | null }>()
+        const readyCount = ready?.n ?? 0
+        if (readyCount !== 1) {
+          // 0: never successfully notified — initial path owns it.
+          // 2+: already manually re-notified — that was its reminder.
+          out.skipped += 1
+          continue
+        }
+        const latestMs = ready?.latest ? Date.parse(ready.latest) : NaN
+        if (!Number.isFinite(latestMs) || latestMs > staleBeforeMs) {
+          out.skipped += 1
+          continue
+        }
+        const reminded = await db
+          .prepare(
+            `SELECT id FROM notifications WHERE event_type='DRAFT_REMINDER' AND channel='PUSH' AND status='SENT' AND provider_message_id LIKE ?`,
+          )
+          .bind(`${draft.id}:%`)
+          .first<{ id: string }>()
+        if (reminded) {
+          out.skipped += 1
+          continue
+        }
+        const result = await notifyDadDraftReminder(db, env, {
+          id: draft.id,
+          complaintId: draft.complaint_id,
+          externalCaseId: draft.external_case_id,
+        })
+        if (result.sent) out.reminded += 1
+        else out.skipped += 1
+      } catch {
+        // One bad draft never blocks the rest of the sweep.
+        out.skipped += 1
+      }
+    }
+  } catch {
+    // The sweep itself never throws; the tick reports discovery regardless.
+  }
+  return out
 }

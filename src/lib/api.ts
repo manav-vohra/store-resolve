@@ -242,6 +242,24 @@ export const api = {
         ),
       }),
     ),
+  // Reply drafts still waiting for Dad's review (DRAFT state only).
+  listPendingDrafts: () =>
+    request(
+      '/drafts/pending',
+      z.object({
+        ok: z.literal(true),
+        drafts: z.array(
+          z.object({
+            id: z.string(),
+            complaintId: z.string(),
+            externalCaseId: z.string(),
+            category: z.string(),
+            responseKind: z.string(),
+            createdAt: z.string(),
+          }),
+        ),
+      }),
+    ),
   createResponseDraft: (complaintId: string, body: { body: string; responseKind?: string }) =>
     request(
       `/complaints/${encodeURIComponent(complaintId)}/response-drafts`,
